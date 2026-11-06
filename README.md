@@ -122,3 +122,14 @@ results depend on the machine and storage device.
 The tested validation workflow is provided as `docs/ci-workflow.yml.example`.
 To enable GitHub Actions, copy it to `.github/workflows/ci.yml` using a GitHub
 credential with workflow permissions. CI is not enabled in this initial upload.
+
+## Separate graph window
+
+Chat opens a read-only Qt window showing up to 128 resident word nodes and
+512 directed connections. Click a node to highlight its neighbors; hover to see
+its learned strength. The drawing updates when snapshots change, without
+continuous animation. Lazy-loading diagnostics are no longer printed in chat.
+This window needs Python 3 and PySide6; the learning engine remains CPU-only.
+Snapshots travel through a private process pipe and are not saved to disk.
+Logout and session expiry clear the display; closing the window leaves chat usable.
+The view shows the resident graph, not the full network or a literal thought trace.

@@ -87,3 +87,21 @@ fn graph_larger_than_working_set_can_finish_without_retraining() {
         "continuation must advance beyond its original working set"
     );
 }
+
+#[test]
+fn graph_window_only_exposes_resident_graph_during_authenticated_session() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("view.db");
+    let mut app = App::create_empty(&path, "review", PASSWORD, None, None).unwrap();
+    assert_eq!(app.graph_view()["locked"], true);
+    app.login("review", PASSWORD, None).unwrap();
+    app.message("hallo jinx").unwrap();
+    let view = app.graph_view();
+    assert_eq!(view["locked"], false);
+    assert!(!view["nodes"].as_array().unwrap().is_empty());
+    assert!(view["nodes"].as_array().unwrap().len() <= 128);
+    assert!(view["edges"].as_array().unwrap().len() <= 512);
+    app.logout();
+    assert_eq!(app.graph_view()["locked"], true);
+    assert!(app.graph_view()["nodes"].as_array().unwrap().is_empty());
+}

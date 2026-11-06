@@ -1,3 +1,4 @@
+mod viewer;
 use anyhow::{bail, Result};
 use saeugling::{App, Import};
 use std::{
@@ -72,24 +73,6 @@ impl Drop for CredentialWait {
 }
 fn show_reply(reply: saeugling::Reply) {
     println!("{}", reply.text);
-    if let Some(progress) = reply.activation {
-        let phase = match progress.phase.as_str() {
-            "complete" => "vollständig",
-            "budget_limited" if progress.can_continue => {
-                "Budget erreicht; Fortsetzung mit /continue möglich"
-            }
-            "budget_limited" => "Budget erreicht; keine Fortsetzung verfügbar",
-            _ => "vorläufig",
-        };
-        println!(
-            "[Aktivierung: {phase}; {} Knoten von {}, {} Seiten, {} Archivepisoden geladen, {} Quellen-Treffer]",
-            progress.nodes_loaded,
-            progress.node_budget,
-            progress.pages_loaded,
-            progress.sources_loaded,
-            progress.source_matches.len()
-        );
-    }
 }
 fn main() {
     if let Err(e) = run() {
@@ -152,14 +135,15 @@ fn run() -> Result<()> {
         bail!("chat VAULT");
     }
     let app = Arc::new(Mutex::new(App::open(Path::new(&args[1]))?));
+    let graph_viewer = viewer::GraphViewer::open();
+    let idle_viewer = Arc::clone(&graph_viewer);
     let weak = Arc::downgrade(&app);
     let credential_wait = Arc::new(AtomicBool::new(false));
     let idle_gate = Arc::clone(&credential_wait);
     let (progress_tx, progress_rx) = mpsc::channel::<String>();
     // Expire sessions and prefetch one bounded graph step while the user types.
-    // Credential prompts suppress prefetch; progress uses cursor save/restore.
+    // Credential prompts suppress prefetch; the graph is shown in a separate window.
     std::thread::spawn(move || {
-        let mut last_status: Option<(usize, usize, usize, String)> = None;
         let mut last_error: Option<String> = None;
         loop {
             std::thread::sleep(Duration::from_secs(1));
@@ -168,30 +152,13 @@ fn run() -> Result<()> {
             };
             if let Ok(mut app) = app.lock() {
                 app.tick();
+                idle_viewer.publish(&app.graph_view());
                 if !idle_gate.load(Ordering::Relaxed) {
                     match app.prefetch_idle_step() {
-                        Ok(Some(status)) => {
-                            let snapshot = (
-                                status.nodes_loaded,
-                                status.frontier_remaining,
-                                status.sources_loaded,
-                                status.phase.clone(),
-                            );
-                            if last_status.as_ref() != Some(&snapshot) {
-                                let message = format!(
-                                "[Jinx arbeitet weiter: {} Knoten, {} Seiten, {} Archivepisoden geladen, {} offene Graphverweise]",
-                                status.nodes_loaded,
-                                status.pages_loaded,
-                                status.sources_loaded,
-                                status.frontier_remaining
-                            );
-                                let _ = progress_tx.send(message);
-                                last_status = Some(snapshot);
-                            }
+                        Ok(Some(_status)) => {
                             last_error = None;
                         }
                         Ok(None) => {
-                            last_status = None;
                             last_error = None;
                         }
                         Err(error) => {
@@ -201,7 +168,6 @@ fn run() -> Result<()> {
                                     .send(format!("[Vorladung fehlgeschlagen: {error}]"));
                                 last_error = Some(error);
                             }
-                            last_status = None;
                         }
                     }
                 }
@@ -240,15 +206,7 @@ fn run() -> Result<()> {
             } else if command == "/status" {
                 println!("{}", app.lock().unwrap().status()?);
             } else if command == "/continue" {
-                let reply = app
-                    .lock()
-                    .unwrap()
-                    .continue_message_with_progress(|progress| {
-                        println!(
-                            "[Graphaktivierung: {} Knoten, {} Seiten; {} Quellen geladen]",
-                            progress.nodes_loaded, progress.pages_loaded, progress.sources_loaded
-                        );
-                    })?;
+                let reply = app.lock().unwrap().continue_message()?;
                 show_reply(reply);
             } else if command == "/verify-archive" {
                 println!("Prüfe alle verschlüsselten Archivblöcke …");
@@ -331,23 +289,17 @@ fn run() -> Result<()> {
                     "Unbekannter Befehl. /login ohne Passwort in der Nachrichtenzeile verwenden."
                 );
             } else {
-                let reply = app
-                    .lock()
-                    .unwrap()
-                    .message_with_progress(&line, |progress| {
-                        println!(
-                            "[Graphaktivierung: {} Knoten, {} Seiten; {} Verweise, {} Archivepisoden geladen]",
-                            progress.nodes_loaded, progress.pages_loaded, progress.source_refs_seen, progress.sources_loaded
-                        );
-                    })?;
+                let reply = app.lock().unwrap().message(&line)?;
                 show_reply(reply);
             }
             Ok(())
         })();
+        graph_viewer.publish(&app.lock().unwrap().graph_view());
         if let Err(e) = result {
             println!("{e}");
         }
     }
     app.lock().unwrap().logout();
+    graph_viewer.close();
     Ok(())
 }
