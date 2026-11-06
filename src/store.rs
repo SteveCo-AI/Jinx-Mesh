@@ -1,5 +1,6 @@
 use crate::{
     crypto::{self, Key},
+    journal::{JournalEintrag, JournalVermerk},
     model::{GraphSlice, Node, State},
 };
 use anyhow::{bail, Context, Result};
@@ -36,6 +37,8 @@ pub(crate) struct Payload {
     pub graph_count: u64,
     #[serde(default)]
     pub graph_root: Vec<u8>,
+    #[serde(default)]
+    pub op_journal_seq: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -78,6 +81,10 @@ pub(crate) struct Store {
     username: String,
     salt: Vec<u8>,
     version: u64,
+    /// Test-only crash simulation: fail the next commit before it starts,
+    /// leaving a write-ahead op-journal entry unconfirmed.
+    #[cfg(test)]
+    pub(crate) crash_vor_commit: bool,
 }
 fn limited(path: &Path) -> Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -172,7 +179,8 @@ impl Store {
             CREATE TABLE graph_records(id_hash BLOB PRIMARY KEY, sealed BLOB NOT NULL);
             CREATE TABLE graph_manifest(id INTEGER PRIMARY KEY CHECK(id=1), node_count INTEGER NOT NULL, root BLOB NOT NULL);
             CREATE TABLE traversal_checkpoints(id_hash BLOB PRIMARY KEY, revision INTEGER NOT NULL, sealed BLOB NOT NULL);
-            CREATE TABLE throttle(id INTEGER PRIMARY KEY CHECK(id=1),failures INTEGER NOT NULL,next_allowed INTEGER NOT NULL);")?;
+            CREATE TABLE throttle(id INTEGER PRIMARY KEY CHECK(id=1),failures INTEGER NOT NULL,next_allowed INTEGER NOT NULL);
+            CREATE TABLE op_journal(seq INTEGER PRIMARY KEY, sealed BLOB NOT NULL);")?;
         let salt = crypto::random::<16>().to_vec();
         let key = crypto::derive(password, &salt)?;
         let graph_records = seal_graph_records(&state, &key)?;
@@ -184,6 +192,8 @@ impl Store {
             username: user.into(),
             salt,
             version: 3,
+            #[cfg(test)]
+            crash_vor_commit: false,
         };
         let mut payload = Payload {
             state,
@@ -195,6 +205,7 @@ impl Store {
             archive_root: vec![0; 32],
             graph_count,
             graph_root: graph_root.clone(),
+            op_journal_seq: 0,
         };
         payload.state = state_projection(&payload.state, store.version);
         let sealed = crypto::seal(
@@ -259,7 +270,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS graph_shards(id INTEGER PRIMARY KEY CHECK(id BETWEEN 0 AND 255), sealed BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS graph_records(id_hash BLOB PRIMARY KEY, sealed BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS graph_manifest(id INTEGER PRIMARY KEY CHECK(id=1), node_count INTEGER NOT NULL, root BLOB NOT NULL);
-            CREATE TABLE IF NOT EXISTS traversal_checkpoints(id_hash BLOB PRIMARY KEY, revision INTEGER NOT NULL, sealed BLOB NOT NULL);")?;
+            CREATE TABLE IF NOT EXISTS traversal_checkpoints(id_hash BLOB PRIMARY KEY, revision INTEGER NOT NULL, sealed BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS op_journal(seq INTEGER PRIMARY KEY, sealed BLOB NOT NULL);")?;
         let (version, username, salt): (u64, String, Vec<u8>) = conn.query_row(
             "SELECT version,username,salt FROM metadata WHERE id=1",
             [],
@@ -274,7 +286,12 @@ impl Store {
             username,
             salt,
             version,
+            #[cfg(test)]
+            crash_vor_commit: false,
         })
+    }
+    pub(crate) fn version(&self) -> u64 {
+        self.version
     }
     fn aad(&self, domain: &str) -> Vec<u8> {
         format!("saeugling-v{}:{}:{domain}", self.version, self.username).into_bytes()
@@ -382,6 +399,7 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn commit(
         &mut self,
         payload: &mut Payload,
@@ -390,7 +408,14 @@ impl Store {
         key: &Key,
         event: &str,
         episodes_to_append: &[Value],
+        vermerk: &JournalVermerk,
     ) -> Result<()> {
+        #[cfg(test)]
+        {
+            if self.crash_vor_commit {
+                bail!("Simulierter Absturz vor dem Commit");
+            }
+        }
         if self.version < 3
             && old
                 .neuronen
@@ -406,6 +431,12 @@ impl Store {
         let previous = serde_json::to_value(state_projection(old, self.version))?;
         let next = serde_json::to_value(state_projection(&payload.state, self.version))?;
         let delta = json!({"event":event,"patch":json_patch::diff(&previous,&next)});
+        // Confirming a write-ahead op-journal entry happens in the same
+        // transaction as the state it describes; anything else is a crash
+        // remnant that the next unlock discards.
+        if let Some(bestaetigt) = vermerk.bestaetigt {
+            payload.op_journal_seq = bestaetigt;
+        }
         let journal = crypto::seal(
             key,
             &Zeroizing::new(serde_json::to_vec(&delta)?),
@@ -418,16 +449,30 @@ impl Store {
         // read path does not borrow the connection while a write transaction is live.
         let mut graph_upserts = Vec::new();
         let mut graph_new_count = 0u64;
+        let entfernte_lookups: Vec<Vec<u8>> = if self.version >= 3 {
+            vermerk
+                .graph_entfernungen
+                .iter()
+                .map(|id| graph_lookup(key, id))
+                .collect()
+        } else {
+            Vec::new()
+        };
         if self.version >= 3 {
             for (id, node) in &graph_new.nodes {
-                let mut edges = self
-                    .graph_nodes(key, std::slice::from_ref(id))?
-                    .edges
-                    .remove(id)
-                    .unwrap_or_default();
-                if let Some(updates) = graph_new.edges.get(id) {
-                    edges.extend(updates.clone());
-                }
+                // The update map is the authoritative post-commit state of the
+                // record's outgoing edges (changed_graph always carries the
+                // complete map), so a retracted pair — an undone edge creation
+                // or a heal's edge rewrite — disappears from the vault too
+                // instead of surviving a union with the stored map.
+                let edges = match graph_new.edges.get(id) {
+                    Some(updates) => updates.clone(),
+                    None => self
+                        .graph_nodes(key, std::slice::from_ref(id))?
+                        .edges
+                        .remove(id)
+                        .unwrap_or_default(),
+                };
                 let record = GraphRecord {
                     node: node.clone(),
                     edges,
@@ -450,12 +495,19 @@ impl Store {
             }
         }
         let next_graph_root = if self.version >= 3 {
-            graph_mutation_root(key, &payload.graph_root, &graph_upserts)
+            graph_mutation_root(key, &payload.graph_root, &graph_upserts, &entfernte_lookups)
         } else {
             Vec::new()
         };
         let tx = self.conn.transaction()?;
         tx.execute("INSERT INTO audit VALUES(?1,?2)", params![seq, journal])?;
+        // Undo removes a journal suffix atomically with the state restoration.
+        if let Some(streichen_ab) = vermerk.streichen_ab {
+            tx.execute(
+                "DELETE FROM op_journal WHERE seq >= ?1",
+                params![streichen_ab],
+            )?;
+        }
         // Append only newly observed episodes as individually authenticated blocks.
         // Readers can fetch bounded pages without loading this archive into memory.
         {
@@ -482,7 +534,19 @@ impl Store {
             for (lookup, sealed) in &graph_upserts {
                 tx.execute("INSERT INTO graph_records(id_hash,sealed) VALUES(?1,?2) ON CONFLICT(id_hash) DO UPDATE SET sealed=excluded.sealed",params![lookup,sealed])?;
             }
-            payload.graph_count = payload.graph_count.saturating_add(graph_new_count);
+            // Undo of a neuron creation removes its record; every edge into
+            // it was already rolled back by the same journal suffix.
+            let mut entfernt_count = 0u64;
+            for lookup in &entfernte_lookups {
+                entfernt_count += tx.execute(
+                    "DELETE FROM graph_records WHERE id_hash=?1",
+                    params![lookup],
+                )? as u64;
+            }
+            payload.graph_count = payload
+                .graph_count
+                .saturating_add(graph_new_count)
+                .saturating_sub(entfernt_count);
             payload.graph_root = next_graph_root.clone();
             tx.execute(
                 "UPDATE graph_manifest SET node_count=?1,root=?2 WHERE id=1",
@@ -521,6 +585,75 @@ impl Store {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM audit", [], |r| r.get(0))?)
+    }
+
+    /// Write-ahead append of one learning step, durable before its state
+    /// change commits. Applies the configured journal cap by dropping the
+    /// oldest entries.
+    pub(crate) fn journal_append(
+        &mut self,
+        key: &Key,
+        eintrag: &JournalEintrag,
+        kap: usize,
+    ) -> Result<()> {
+        let sealed = crypto::seal(
+            key,
+            &Zeroizing::new(serde_json::to_vec(eintrag)?),
+            &self.aad(&format!("opjournal:{}", eintrag.seq)),
+        )?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO op_journal VALUES(?1,?2)",
+            params![eintrag.seq, sealed],
+        )?;
+        let count: u64 = tx.query_row("SELECT COUNT(*) FROM op_journal", [], |r| r.get(0))?;
+        if count > kap as u64 {
+            tx.execute(
+                "DELETE FROM op_journal WHERE seq IN (SELECT seq FROM op_journal ORDER BY seq LIMIT ?1)",
+                params![count - kap as u64],
+            )?;
+        }
+        Ok(tx.commit()?)
+    }
+
+    /// Crash recovery and bounded load of the rollbackable learning steps.
+    /// Entries beyond the committed confirmation seq were never part of a
+    /// persisted state, so they are discarded and counted for the honest
+    /// first /status notice.
+    pub(crate) fn journal_sync(
+        &mut self,
+        key: &Key,
+        bestaetigt_bis: u64,
+        kap: usize,
+    ) -> Result<(Vec<JournalEintrag>, u64)> {
+        let verworfen = self.conn.execute(
+            "DELETE FROM op_journal WHERE seq > ?1",
+            params![bestaetigt_bis],
+        )? as u64;
+        let count: u64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM op_journal", [], |r| r.get(0))?;
+        if count > kap as u64 {
+            self.conn.execute(
+                "DELETE FROM op_journal WHERE seq IN (SELECT seq FROM op_journal ORDER BY seq LIMIT ?1)",
+                params![count - kap as u64],
+            )?;
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT seq,sealed FROM op_journal ORDER BY seq")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
+        let mut journal = Vec::new();
+        for row in rows {
+            let (seq, blob) = row?;
+            let plain = crypto::unseal(key, &blob, &self.aad(&format!("opjournal:{seq}")))?;
+            let eintrag: JournalEintrag = serde_json::from_slice(&plain)?;
+            if eintrag.seq != seq {
+                bail!("Op-Journal-Sequenz passt nicht zum Eintrag");
+            }
+            journal.push(eintrag);
+        }
+        Ok((journal, verworfen))
     }
 
     pub fn archive_page(&self, key: &Key, offset: u64, limit: usize) -> Result<Vec<Value>> {
@@ -863,20 +996,31 @@ fn graph_records_root(key: &Key, records: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     h.finalize().into_bytes().to_vec()
 }
 
-fn graph_mutation_root(key: &Key, previous: &[u8], records: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+fn graph_mutation_root(
+    key: &Key,
+    previous: &[u8],
+    records: &[(Vec<u8>, Vec<u8>)],
+    entfernte: &[Vec<u8>],
+) -> Vec<u8> {
     use hmac::{Hmac, Mac};
     use sha2::{Digest, Sha256};
-    if records.is_empty() {
+    if records.is_empty() && entfernte.is_empty() {
         return previous.to_vec();
     }
     let mut records = records.to_vec();
     records.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut entfernt = entfernte.to_vec();
+    entfernt.sort();
     let mut h = Hmac::<Sha256>::new_from_slice(key.as_ref()).expect("HMAC accepts any key");
     h.update(b"saeugling-v3-graph-root-update");
     h.update(previous);
     for (lookup, sealed) in records {
         h.update(&lookup);
         h.update(&Sha256::digest(sealed));
+    }
+    for lookup in entfernt {
+        h.update(b"removed:");
+        h.update(&lookup);
     }
     h.finalize().into_bytes().to_vec()
 }
@@ -1014,7 +1158,15 @@ mod storage_tests {
             json!({"id":"episode:2","sequence":2,"speaker":"user","text":"second"}),
         ];
         store
-            .commit(&mut payload, &old, &updates, &key, "test", &episodes)
+            .commit(
+                &mut payload,
+                &old,
+                &updates,
+                &key,
+                "test",
+                &episodes,
+                &Default::default(),
+            )
             .unwrap();
         assert_eq!(payload.graph_count, 140);
         assert_eq!(payload.archive_count, 3);
@@ -1071,7 +1223,15 @@ mod storage_tests {
         dirty.nodes.insert(n.id.clone(), n.clone());
         payload.state.neuronen.insert(n.id.clone(), n);
         store
-            .commit(&mut payload, &old, &dirty, &key, "test", &[])
+            .commit(
+                &mut payload,
+                &old,
+                &dirty,
+                &key,
+                "test",
+                &[],
+                &Default::default(),
+            )
             .unwrap();
         let mut blob: Vec<u8> = store
             .conn

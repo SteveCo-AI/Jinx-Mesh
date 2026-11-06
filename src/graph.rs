@@ -1,10 +1,14 @@
 use crate::model::{Node, State};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) fn tokens(text: &str) -> Vec<String> {
     crate::language::parse(text).words
 }
-pub(crate) fn word(state: &State, t: &str) -> Option<String> {
+/// Name-based lexical lookup WITHOUT alias resolution: the node whose id or
+/// legacy label carries the token. The Kap.-21 heal commands address a word
+/// by its name even when it is already folded into another word.
+pub(crate) fn wort_namentlich(state: &State, t: &str) -> Option<String> {
     let id = format!("lex:{t}");
     if state.neuronen.get(&id).is_some_and(|n| n.typ == "LEX") {
         return Some(id);
@@ -15,6 +19,30 @@ pub(crate) fn word(state: &State, t: &str) -> Option<String> {
         .iter()
         .find(|(_, n)| n.typ == "LEX" && tokens(&n.label).as_slice() == [t])
         .map(|(id, _)| id.clone())
+}
+/// Follow the `neuron_aliases` chain while every hop is a resident node; the
+/// last resident member is the token's canonical word (Kap. 21). A cold hop
+/// is a paging artifact and stops the walk instead of inventing a missing id.
+pub(crate) fn alias_aufloesung(state: &State, start: &str) -> String {
+    let alias = state.extra.get("neuron_aliases").and_then(Value::as_object);
+    let mut aktuell = start.to_owned();
+    let mut besucht = BTreeSet::new();
+    while besucht.insert(aktuell.clone()) {
+        let Some(next) = alias.and_then(|a| a.get(&aktuell)).and_then(Value::as_str) else {
+            break;
+        };
+        if !state.neuronen.contains_key(next) {
+            break;
+        }
+        aktuell = next.to_owned();
+    }
+    aktuell
+}
+pub(crate) fn word(state: &State, t: &str) -> Option<String> {
+    let id = wort_namentlich(state, t)?;
+    // The resolution result is always a resident node: the chain only hops
+    // onto resident ids, so callers can index state.neuronen with it.
+    Some(alias_aufloesung(state, &id))
 }
 
 pub(crate) fn edge(state: &State, a: &str, b: &str) -> Option<f64> {
@@ -29,12 +57,62 @@ pub(crate) fn set_edge(state: &mut State, a: &str, b: &str, w: f64) {
 }
 pub(crate) fn grow(state: &mut State, tokens: &[String], budget: usize) -> usize {
     let mut n = 0;
+    // Kap. 21/22 fold gate, read once: None while the word level has no
+    // registered verification source — then no fold may even be proposed.
+    let gate = crate::healing::fold_gate(state);
     for t in tokens {
         if n >= budget || state.neuronen.len() >= 200_000 {
             break;
         }
         if word(state, t).is_some() {
             continue;
+        }
+        // Kap. 21: the code corpus namespace (code:word:/code:char: prefixed
+        // tokens, see code_tokens) is no spelling — it never folds.
+        if !t.contains(':') {
+            if let Some(gate) = &gate {
+                if let Some((kanon, label, distanz)) = crate::healing::fold_kandidat(state, t, gate)
+                {
+                    if crate::healing::fold_beweis(t, &label, distanz) >= gate.schwelle {
+                        let id = format!("lex:{t}");
+                        let mut extra = BTreeMap::new();
+                        // The origin stays visible: the node keeps its label,
+                        // ring, alias entry, and this marker (non-destructive).
+                        extra.insert("folding_origin".into(), serde_json::json!(true));
+                        state.neuronen.insert(
+                            id.clone(),
+                            Node {
+                                id: id.clone(),
+                                typ: "LEX".into(),
+                                label: t.clone(),
+                                staerke: state.number("start_staerke").clamp(0.0, 1.0),
+                                alter: "jung".into(),
+                                nutzt: 0,
+                                geboren: state.interaktionen,
+                                ring: Some(kanon.clone()),
+                                extra,
+                            },
+                        );
+                        let alias = state
+                            .extra
+                            .entry("neuron_aliases".into())
+                            .or_insert_with(|| serde_json::json!({}));
+                        if let Some(map) = alias.as_object_mut() {
+                            map.insert(id, serde_json::json!(kanon));
+                        }
+                        // The token's edges route through the alias from now
+                        // on (word() resolves it to the canonical node), and
+                        // the confirmed fold grows the word level's credit.
+                        crate::healing::erfolg(state, crate::healing::EBENE_WORT);
+                        n += 1;
+                        continue;
+                    }
+                    // The level proposed a fold and the verification source
+                    // forbade it: a failed heal (Kap. 22), the word stays its
+                    // own independent node.
+                    crate::healing::misserfolg(state, crate::healing::EBENE_WORT);
+                }
+            }
         }
         let id = format!("lex:{t}");
         state.neuronen.insert(
@@ -291,6 +369,10 @@ pub(crate) fn consolidate(state: &mut State) {
         }
     }
     let _report = crate::healing::heal(state);
+    // Kap. 21: the consistency check of every learned sequence edge runs in
+    // the consolidation round — heavily used edges the confirmed path
+    // weights contradict get damped into the suspicion ledger, not deleted.
+    let _verdaechte = crate::healing::verdachts_pruefung(state);
     state.letzte_slaap = state.interaktionen;
 }
 pub(crate) fn starts(state: &State, ts: &[String]) -> Vec<String> {

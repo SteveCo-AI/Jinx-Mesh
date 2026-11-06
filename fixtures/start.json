@@ -1,16 +1,50 @@
 {
   "schema_version": "2.0.0-alpha.2",
   "konfig": {
+    "anker_gewicht": 0.5,
+    "anker_gewicht_min": 0.0,
+    "anker_minus": "nein",
+    "anker_plus": "super",
+    "anker_reif_fenster": 50,
+    "anker_reif_schritt": 0.05,
+    "anker_reif_ueber_einstimmig": 0.85,
     "auto_slaap_ab": 60,
     "daempf_faktor": 0.7,
+    "fallback_drossel_max": 2,
+    "fallback_frage_geruest": ["meinst du {wort}?", "wie meinst du {wort}?", "ist {wort} so gemeint?"],
+    "fallback_status_durchsage": ["ich bin mir bei {wort} noch unsicher", "zu {wort} habe ich noch kein klares signal"],
+    "fallback_unklar_min": 0.25,
+    "folding_min_nutzt": 2,
+    "folding_schwelle": 2,
+    "gate_regeln": {
+      "erwartet_entfernt": false,
+      "erwartet_gewicht_range": [-1.0, 1.0],
+      "erwartet_neue_knoten_max": 128,
+      "pflichtfelder_extra": []
+    },
+    "heal_befehl_muster": {"echtes_wort": "{x}", "falsch": "{x} ist {y}"},
+    "heil_schritt": 0.1,
+    "heil_schwelle_max": 1.0,
+    "heil_schwelle_min": 0.0,
+    "implizit_positiv": 0.1,
+    "journal_kap": 500,
     "max_neu_pro_nachricht": 128,
     "max_pfad_len": 128,
+    "mutation_aktivier": false,
+    "mutation_langeweile_ab_versuchen": 3,
+    "mutation_langeweile_schwelle": 0.8,
+    "mutation_rate": 0.1,
+    "mutation_schwellwert": 0.8,
+    "mutation_temperatur": 0.2,
+    "mutation_wildheit_schritt": 0.2,
     "paar_basis": 0.2,
     "paar_deckel": 0.95,
     "paar_zuwachs": 0.1,
     "praezise_ab_nutzt": 3,
     "staerke_zuwachs": 0.05,
     "start_staerke": 0.2,
+    "verdacht_min_nutzt": 3,
+    "verdacht_schwelle": -0.5,
     "reif_ab_nutzt": 5
   },
   "neuronen": {},
@@ -21,5 +55,9 @@
   "formulierungen": {},
   "historie": [],
   "kontext": {},
-  "lab": {}
+  "lab": {},
+  "verifikations_ebenen": {
+    "struktur": {"heil_schwelle": 0.5, "quelle": "konkurrierende_pfade", "verification_credit": 0},
+    "wort": {"heil_schwelle": 0.5, "quelle": "kontext_aehnlichkeit", "verification_credit": 0}
+  }
 }

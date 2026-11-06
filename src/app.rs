@@ -2,6 +2,7 @@ use crate::{
     crypto::Key,
     engine::Engine,
     graph,
+    journal::{self, JournalEintrag, JournalVermerk},
     model::{ActivationStatus, GraphSlice, Reply, SourceMatch, State},
     store::{Import, Payload, Store, TraversalCheckpoint},
 };
@@ -44,6 +45,15 @@ struct Session {
     started: Instant,
     last: Instant,
     frozen: bool,
+    /// Committed, still rollbackable learning steps (Kap. 14 op-journal).
+    journal: Vec<JournalEintrag>,
+}
+
+/// Undo-Umfang eines /undo-Befehls: die letzten n Schritte oder die ganze
+/// Runde ab der letzten Konsolidierungsgrenze.
+enum Umfang {
+    Schritte(u64),
+    Runde,
 }
 impl Drop for Session {
     fn drop(&mut self) {
@@ -56,6 +66,9 @@ pub struct App {
     store: Store,
     session: Option<Session>,
     policy: SessionPolicy,
+    /// Unconfirmed op-journal steps discarded by recovery, still waiting to be
+    /// reported honestly at the first /status.
+    verworfen_ungemeldet: u64,
 }
 
 /// Bounded archive retrieval result. `complete` is false when the configured
@@ -102,6 +115,7 @@ impl App {
             store: Store::create(path, user, password, totp_secret, Some(import))?,
             session: None,
             policy: SessionPolicy::default(),
+            verworfen_ungemeldet: 0,
         })
     }
     /// Fresh vault with zero vocabulary, zero concepts and no response templates.
@@ -121,6 +135,7 @@ impl App {
             store: Store::create(path, user, password, totp_secret, None)?,
             session: None,
             policy: SessionPolicy::default(),
+            verworfen_ungemeldet: 0,
         })
     }
     pub fn open(path: &Path) -> Result<Self> {
@@ -128,6 +143,7 @@ impl App {
             store: Store::open(path)?,
             session: None,
             policy: SessionPolicy::default(),
+            verworfen_ungemeldet: 0,
         })
     }
     pub fn with_policy(mut self, policy: SessionPolicy) -> Self {
@@ -193,6 +209,12 @@ impl App {
             }
         };
         self.store.authenticated(&payload, &key)?;
+        // Crash recovery: journal entries beyond the committed confirmation
+        // seq never belonged to a persisted state and are discarded here.
+        let kap = journal::kap(&payload.state);
+        let (session_journal, verworfen) =
+            self.store.journal_sync(&key, payload.op_journal_seq, kap)?;
+        self.verworfen_ungemeldet = self.verworfen_ungemeldet.saturating_add(verworfen);
         let graph_cache = if payload.state.neuronen.is_empty() {
             GraphSlice::default()
         } else {
@@ -214,6 +236,7 @@ impl App {
             started: Instant::now(),
             last: Instant::now(),
             frozen: false,
+            journal: session_journal,
         });
         Ok(())
     }
@@ -334,6 +357,10 @@ impl App {
             Engine::active_state(&s.payload.state, &s.graph_cache),
             s.payload.actions.clone(),
         )?;
+        // Persisted view of the section this move can affect, captured after
+        // activation and before any learning mutates it; journal ops diff
+        // exactly against this snapshot.
+        let journiert_alt = s.graph_cache.clone();
         if let Some(target) = &s.feedback_target {
             s.engine
                 .state
@@ -360,6 +387,69 @@ impl App {
                 ];
                 Engine::merge_active(&mut s.graph_cache, &s.engine.state);
                 s.payload.state = metadata_after(&old_metadata, &s.engine.state);
+                // Write-ahead learning step (Kap. 14): the journal entry
+                // becomes durable before the state change commits, so a crash
+                // in between leaves an honestly discardable unconfirmed entry.
+                // Kap. 18: an anchor word rates the previous response like an
+                // explicit +/- prefix, and an anker-weight maturation is a
+                // feedback-driven adjustment — both share the art "feedback".
+                let art = if feedback.is_some()
+                    || reply.anker.is_some()
+                    || old_metadata.extra.get("anker_gewicht")
+                        != s.payload.state.extra.get("anker_gewicht")
+                {
+                    journal::ART_FEEDBACK
+                } else {
+                    journal::ART_LEARN
+                };
+                let journal_seq = s
+                    .payload
+                    .op_journal_seq
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("Journal voll"))?;
+                let eintrag = journal::eintrag(
+                    journal_seq,
+                    s.engine.state.interaktionen,
+                    art,
+                    now,
+                    journal::Ausschnitt {
+                        cache: &journiert_alt,
+                        meta: &old_metadata,
+                    },
+                    journal::Ausschnitt {
+                        cache: &s.graph_cache,
+                        meta: &s.payload.state,
+                    },
+                )?;
+                // Kap.-24 integration gate: the proposed learning diff is
+                // checked against the konfig rule data before anything
+                // persists. A reject restores the pre-move state exactly;
+                // only the rejection marker (art "integration_reject")
+                // commits — the move itself never does.
+                let gruende = crate::gate::verify(
+                    &old_metadata,
+                    &eintrag.ops,
+                    &crate::gate::regeln(&s.engine.state),
+                );
+                if !gruende.is_empty() {
+                    let nummer = old.interaktionen.saturating_add(1);
+                    s.engine.state = old;
+                    s.graph_cache = prior_graph;
+                    s.payload.state = old_metadata;
+                    if let Err(e) = gate_reject_vermerken(&mut self.store, s, nummer) {
+                        self.session = None;
+                        return Err(e);
+                    }
+                    bail!("{}", crate::gate::hinweis(&gruende));
+                }
+                let mut neuer_eintrag = None;
+                let mut vermerk = JournalVermerk::default();
+                if !eintrag.ops.is_empty() {
+                    let kap = journal::kap(&s.engine.state);
+                    self.store.journal_append(key, &eintrag, kap)?;
+                    vermerk.bestaetigt = Some(journal_seq);
+                    neuer_eintrag = Some(eintrag);
+                }
                 let graph_updates = changed_graph(&prior_graph, &s.graph_cache);
                 if let Err(e) = self.store.commit(
                     &mut s.payload,
@@ -368,10 +458,18 @@ impl App {
                     s.key.as_ref().expect("developer key"),
                     "dialog",
                     &archived,
+                    &vermerk,
                 ) {
                     // Fail closed after a storage error, never continue with uncommitted learning.
                     self.session = None;
                     return Err(e);
+                }
+                if let Some(eintrag) = neuer_eintrag {
+                    let kap = journal::kap(&s.engine.state);
+                    s.journal.push(eintrag);
+                    while s.journal.len() > kap {
+                        s.journal.remove(0);
+                    }
                 }
                 s.feedback_target = s.engine.state.extra.get("feedback_target").cloned();
                 let mut reply = reply;
@@ -542,27 +640,487 @@ impl App {
             .ok_or_else(|| anyhow::anyhow!("Developer-Anmeldung erforderlich"))?;
         let old_metadata = s.payload.state.clone();
         let before = s.graph_cache.clone();
+        // Pre-round engine state for an exact restore when the Kap.-24 gate
+        // refuses the consolidation round.
+        let alt_aktiv = s.engine.state.clone();
         let healing = crate::healing::heal(&mut s.engine.state);
         graph::consolidate(&mut s.engine.state);
         Engine::merge_active(&mut s.graph_cache, &s.engine.state);
         s.payload.state = metadata_after(&old_metadata, &s.engine.state);
         let graph_updates = changed_graph(&before, &s.graph_cache);
+        // Every consolidation round leaves a journal entry — even without a
+        // learning change it marks the round boundary for /undo round.
+        let zeit = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let journal_seq = s
+            .payload
+            .op_journal_seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Journal voll"))?;
+        let eintrag = journal::eintrag(
+            journal_seq,
+            s.engine.state.interaktionen,
+            journal::ART_CONSOLIDATE,
+            zeit,
+            journal::Ausschnitt {
+                cache: &before,
+                meta: &old_metadata,
+            },
+            journal::Ausschnitt {
+                cache: &s.graph_cache,
+                meta: &s.payload.state,
+            },
+        )?;
+        // Kap.-24 integration gate: the round commits only when its diff
+        // satisfies the rule data; a reject restores the pre-round state
+        // exactly and leaves the rejection marker instead of a boundary.
+        let gruende = crate::gate::verify(
+            &old_metadata,
+            &eintrag.ops,
+            &crate::gate::regeln(&s.engine.state),
+        );
+        if !gruende.is_empty() {
+            let nummer = alt_aktiv.interaktionen;
+            s.engine.state = alt_aktiv;
+            s.graph_cache = before;
+            s.payload.state = old_metadata;
+            if let Err(e) = gate_reject_vermerken(&mut self.store, s, nummer) {
+                self.session = None;
+                return Err(e);
+            }
+            bail!("{}", crate::gate::hinweis(&gruende));
+        }
+        let kap = journal::kap(&s.engine.state);
+        let key = s.key.as_ref().expect("developer key");
+        self.store.journal_append(key, &eintrag, kap)?;
+        let vermerk = JournalVermerk {
+            bestaetigt: Some(journal_seq),
+            ..JournalVermerk::default()
+        };
         if let Err(e) = self.store.commit(
             &mut s.payload,
             &old_metadata,
             &graph_updates,
-            s.key.as_ref().expect("developer key"),
+            key,
             "consolidation",
             &[],
+            &vermerk,
         ) {
             self.session = None;
             return Err(e);
+        }
+        s.journal.push(eintrag);
+        while s.journal.len() > kap {
+            s.journal.remove(0);
         }
         s.last = Instant::now();
         Ok(
             json!({"scope":"active_neighborhood","active_nodes":before.nodes.len(),"aliases_added":healing.aliases_added,"edges_merged":healing.edges_merged,"quarantined":healing.quarantined}),
         )
     }
+
+    /// Roll back the last n committed learning steps exactly (Kap. 14).
+    pub fn undo(&mut self, schritte: u64) -> Result<serde_json::Value> {
+        self.undo_impl(Umfang::Schritte(schritte))
+    }
+
+    /// Roll back the whole current round: the suffix starting at the most
+    /// recent consolidate boundary (inclusive), or the whole journal when no
+    /// boundary exists.
+    pub fn undo_runde(&mut self) -> Result<serde_json::Value> {
+        self.undo_impl(Umfang::Runde)
+    }
+
+    fn undo_impl(&mut self, umfang: Umfang) -> Result<serde_json::Value> {
+        self.tick();
+        let s = self
+            .session
+            .as_mut()
+            .filter(|s| !s.frozen)
+            .ok_or_else(|| anyhow::anyhow!("Developer-Anmeldung erforderlich"))?;
+        if self.store.version() < 3 {
+            bail!("Rollback erfordert das Vault-Format 3");
+        }
+        // Undo always pops a journal suffix, so the ops of a step meet exactly
+        // the state that step produced.
+        let start = match umfang {
+            Umfang::Schritte(n) => s
+                .journal
+                .len()
+                .saturating_sub(usize::try_from(n).unwrap_or(usize::MAX)),
+            Umfang::Runde => journal::runden_index(&s.journal),
+        };
+        if start >= s.journal.len() {
+            return Ok(json!({"zurueckgerollt":0,"ops":0,"journal_länge":s.journal.len()}));
+        }
+        let alte_meta = s.payload.state.clone();
+        let vor_cache = s.graph_cache.clone();
+        let mut entfernte = Vec::new();
+        let mut ops_gesamt = 0usize;
+        for eintrag in s.journal[start..].iter().rev() {
+            entfernte.extend(journal::zurueckrollen(
+                &mut s.graph_cache,
+                &mut s.payload.state,
+                eintrag,
+            )?);
+            ops_gesamt += eintrag.ops.len();
+        }
+        // Cold-section exactness (Kap. 14): a rolled-back edge op can
+        // reference a source record the current working set no longer holds
+        // (a later activation replaced the resident slice). The vault still
+        // keeps that record and the journal's old value must reach it, so
+        // every such record is reloaded and the suffix's edge ops are
+        // re-applied to the stored edge map; the resident case was already
+        // restored in the cache above. Without this, the restored edge would
+        // never be committed and the view would silently lose the node.
+        let kalte_quellen: std::collections::BTreeSet<String> = s.journal[start..]
+            .iter()
+            .flat_map(|eintrag| eintrag.ops.iter())
+            .filter(|op| {
+                op.kind == "kante"
+                    && !s.graph_cache.nodes.contains_key(&op.ziel)
+                    && !entfernte.contains(&op.ziel)
+            })
+            .map(|op| op.ziel.clone())
+            .collect();
+        let kalte_quellen: Vec<String> = kalte_quellen.into_iter().collect();
+        let key = s.key.as_ref().expect("developer key");
+        for chunk in kalte_quellen.chunks(128) {
+            let page = self.store.graph_nodes(key, chunk)?;
+            for (id, node) in page.nodes {
+                let mut edges = page.edges.get(&id).cloned().unwrap_or_default();
+                for eintrag in s.journal[start..].iter().rev() {
+                    for op in eintrag
+                        .ops
+                        .iter()
+                        .rev()
+                        .filter(|op| op.kind == "kante" && op.ziel == id)
+                    {
+                        let Some(ziel) = &op.name else {
+                            continue;
+                        };
+                        match op.alt.as_ref().and_then(serde_json::Value::as_f64) {
+                            Some(gewicht) => {
+                                edges.insert(ziel.clone(), gewicht);
+                            }
+                            None => {
+                                edges.remove(ziel);
+                            }
+                        }
+                    }
+                }
+                s.graph_cache.nodes.insert(id.clone(), node);
+                s.graph_cache.edges.insert(id, edges);
+            }
+        }
+        let aktiv = Engine::active_state(&s.payload.state, &s.graph_cache);
+        s.engine = Engine::new(aktiv, s.payload.actions.clone())?;
+        s.feedback_target = s.payload.state.extra.get("feedback_target").cloned();
+        let graph_updates = changed_graph(&vor_cache, &s.graph_cache);
+        let streichen_ab = s.journal[start].seq;
+        let zurueck = s.journal.len() - start;
+        s.journal.truncate(start);
+        let vermerk = JournalVermerk {
+            streichen_ab: Some(streichen_ab),
+            graph_entfernungen: entfernte,
+            ..JournalVermerk::default()
+        };
+        if let Err(e) = self.store.commit(
+            &mut s.payload,
+            &alte_meta,
+            &graph_updates,
+            s.key.as_ref().expect("developer key"),
+            "undo",
+            &[],
+            &vermerk,
+        ) {
+            self.session = None;
+            return Err(e);
+        }
+        s.last = Instant::now();
+        Ok(json!({"zurueckgerollt":zurueck,"ops":ops_gesamt,"journal_länge":s.journal.len()}))
+    }
+    /// Kap.-21 dialog heal command: parse the argument through the configured
+    /// pattern data (heal_befehl_muster, never a code formulation) and run
+    /// the matching heal. Write mode only — /freeze refuses like the DEV
+    /// feedback; every heal lands in the op-journal as art "heal" and is
+    /// exactly rollbackable via /undo.
+    pub fn heal_befehl(&mut self, befehl: &str, argument: &str) -> Result<serde_json::Value> {
+        self.tick();
+        let (x, y) = {
+            let s = self
+                .session
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Gesperrt: zuerst /login"))?;
+            if s.frozen {
+                bail!("Heilungen sind nur im Schreib-Modus erlaubt");
+            }
+            crate::healing::befehl_parsen(&s.engine.state, befehl, argument)?
+        };
+        match y {
+            Some(y) => self.falsch(&x, &y),
+            None if befehl == "echtes_wort" => self.echtes_wort(&x),
+            None => bail!("Der Heil-Befehl {befehl} erwartet zwei Worte"),
+        }
+    }
+
+    /// Kap. 21 "/falsch x ist y" (formulation from konfig data): x folds
+    /// into the ring of y — every edge from or to x is rewritten onto y
+    /// through the alias, the origin stays visible, and the whole step is
+    /// journaled as art "heal".
+    fn falsch(&mut self, x: &str, y: &str) -> Result<serde_json::Value> {
+        self.tick();
+        let s = self
+            .session
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Gesperrt: zuerst /login"))?;
+        if s.frozen {
+            bail!("Heilungen sind nur im Schreib-Modus erlaubt");
+        }
+        // Kap. 22: without a registered verification source on the word
+        // level the heal fails loudly — never silently, never approximately.
+        crate::healing::ebene_pruefen(&s.engine.state, crate::healing::EBENE_WORT)?;
+        let store = &self.store;
+        let x_id = wort_laden(s, store, x)?;
+        let y_id = wort_laden(s, store, y)?;
+        if x_id == y_id {
+            bail!("Ein Wort kann nicht in sich selbst gefoldet werden");
+        }
+        // Folding x into its own descendant would forge an alias cycle.
+        let mut hop = y_id.clone();
+        let mut besucht = std::collections::BTreeSet::new();
+        while besucht.insert(hop.clone()) {
+            match s
+                .engine
+                .state
+                .extra
+                .get("neuron_aliases")
+                .and_then(|a| a.get(&hop))
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(next) if next == x_id => {
+                    bail!("Folding würde einen Alias-Zykel erzeugen");
+                }
+                Some(next) => hop = next.to_owned(),
+                None => break,
+            }
+        }
+        let alte_meta = s.payload.state.clone();
+        let vor_cache = s.graph_cache.clone();
+        // Kap.-21 edge rewrite in the resident records: every edge from x
+        // moves onto y, every edge into x moves onto y; a conflicting pair
+        // keeps the stronger weight, exactly like the alias merge of the
+        // healing pass. Nothing is deleted — the journal records every op.
+        let mut umgebogen = 0usize;
+        if let Some(quelle) = s.graph_cache.edges.remove(&x_id) {
+            let ziele = s.graph_cache.edges.entry(y_id.clone()).or_default();
+            for (b, gewicht) in quelle {
+                umgebogen += 1;
+                let slot = ziele.entry(b).or_insert(gewicht);
+                if *slot < gewicht {
+                    *slot = gewicht;
+                }
+            }
+        }
+        let quellen: Vec<String> = s.graph_cache.edges.keys().cloned().collect();
+        for quelle in quellen {
+            let Some(ziele) = s.graph_cache.edges.get_mut(&quelle) else {
+                continue;
+            };
+            if let Some(gewicht) = ziele.remove(&x_id) {
+                umgebogen += 1;
+                let slot = ziele.entry(y_id.clone()).or_insert(gewicht);
+                if *slot < gewicht {
+                    *slot = gewicht;
+                }
+            }
+        }
+        s.engine = Engine::new(
+            Engine::active_state(&s.payload.state, &s.graph_cache),
+            s.payload.actions.clone(),
+        )?;
+        let y_label = s.engine.state.neuronen[&y_id].label.clone();
+        {
+            let zustand = &mut s.engine.state;
+            let alias = zustand
+                .extra
+                .entry("neuron_aliases".into())
+                .or_insert_with(|| json!({}));
+            if let Some(map) = alias.as_object_mut() {
+                map.insert(x_id.clone(), json!(y_id.clone()));
+            }
+            let x_label = zustand
+                .neuronen
+                .get_mut(&x_id)
+                .ok_or_else(|| anyhow::anyhow!("Wort ist nicht im Netz: {x}"))?
+                .label
+                .clone();
+            let knoten = zustand.neuronen.get_mut(&x_id).expect("geladenes Wort");
+            knoten.ring = Some(y_id.clone());
+            knoten.extra.insert("folding_origin".into(), json!(true));
+            // Kap. 21 "lernbar": a correction beyond the effective distance
+            // threshold raises the learned threshold in the state.
+            crate::healing::folding_schwelle_anheben(zustand, &x_label, &y_label);
+            // Kap. 22: the user correction is a confirmed heal on the word
+            // level — the credit grows, the threshold sinks.
+            crate::healing::erfolg(zustand, crate::healing::EBENE_WORT);
+            zustand.validate()?;
+        }
+        Engine::merge_active(&mut s.graph_cache, &s.engine.state);
+        s.payload.state = metadata_after(&alte_meta, &s.engine.state);
+        let zeit = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let journal_seq = s
+            .payload
+            .op_journal_seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Journal voll"))?;
+        let eintrag = journal::eintrag(
+            journal_seq,
+            s.engine.state.interaktionen,
+            journal::ART_HEAL,
+            zeit,
+            journal::Ausschnitt {
+                cache: &vor_cache,
+                meta: &alte_meta,
+            },
+            journal::Ausschnitt {
+                cache: &s.graph_cache,
+                meta: &s.payload.state,
+            },
+        )?;
+        let kap = journal::kap(&s.engine.state);
+        self.store
+            .journal_append(s.key.as_ref().expect("developer key"), &eintrag, kap)?;
+        let vermerk = JournalVermerk {
+            bestaetigt: Some(journal_seq),
+            ..JournalVermerk::default()
+        };
+        let graph_updates = changed_graph(&vor_cache, &s.graph_cache);
+        if let Err(e) = self.store.commit(
+            &mut s.payload,
+            &alte_meta,
+            &graph_updates,
+            s.key.as_ref().expect("developer key"),
+            "heal",
+            &[],
+            &vermerk,
+        ) {
+            self.session = None;
+            return Err(e);
+        }
+        s.journal.push(eintrag);
+        while s.journal.len() > kap {
+            s.journal.remove(0);
+        }
+        s.last = Instant::now();
+        Ok(json!({
+            "befehl": "falsch", "x": x, "y": y,
+            "alias": x_id, "ziel": y_id,
+            "kanten_umgebogen": umgebogen,
+        }))
+    }
+
+    /// Kap. 21 "/echtes_wort x" (formulation from konfig data): x loses its
+    /// ring and alias references (Rück-Folding) and becomes a regular
+    /// standalone LEX neuron again. Journaled as art "heal".
+    fn echtes_wort(&mut self, x: &str) -> Result<serde_json::Value> {
+        self.tick();
+        let s = self
+            .session
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Gesperrt: zuerst /login"))?;
+        if s.frozen {
+            bail!("Heilungen sind nur im Schreib-Modus erlaubt");
+        }
+        crate::healing::ebene_pruefen(&s.engine.state, crate::healing::EBENE_WORT)?;
+        let store = &self.store;
+        let x_id = wort_laden(s, store, x)?;
+        let ring = s
+            .engine
+            .state
+            .neuronen
+            .get(&x_id)
+            .and_then(|n| n.ring.clone());
+        let alias_ziel = s
+            .engine
+            .state
+            .extra
+            .get("neuron_aliases")
+            .and_then(|a| a.get(&x_id).cloned());
+        if ring.is_none() && alias_ziel.is_none() {
+            bail!("Wort ist bereits ein eigenständiges Neuron: {x}");
+        }
+        let alte_meta = s.payload.state.clone();
+        let vor_cache = s.graph_cache.clone();
+        {
+            let zustand = &mut s.engine.state;
+            if let Some(alias) = zustand
+                .extra
+                .get_mut("neuron_aliases")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                alias.remove(&x_id);
+            }
+            if let Some(knoten) = zustand.neuronen.get_mut(&x_id) {
+                knoten.ring = None;
+            }
+            // The promotion is a confirmed heal on the word level (Kap. 22).
+            crate::healing::erfolg(zustand, crate::healing::EBENE_WORT);
+            zustand.validate()?;
+        }
+        Engine::merge_active(&mut s.graph_cache, &s.engine.state);
+        s.payload.state = metadata_after(&alte_meta, &s.engine.state);
+        let zeit = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let journal_seq = s
+            .payload
+            .op_journal_seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Journal voll"))?;
+        let eintrag = journal::eintrag(
+            journal_seq,
+            s.engine.state.interaktionen,
+            journal::ART_HEAL,
+            zeit,
+            journal::Ausschnitt {
+                cache: &vor_cache,
+                meta: &alte_meta,
+            },
+            journal::Ausschnitt {
+                cache: &s.graph_cache,
+                meta: &s.payload.state,
+            },
+        )?;
+        let kap = journal::kap(&s.engine.state);
+        self.store
+            .journal_append(s.key.as_ref().expect("developer key"), &eintrag, kap)?;
+        let vermerk = JournalVermerk {
+            bestaetigt: Some(journal_seq),
+            ..JournalVermerk::default()
+        };
+        let graph_updates = changed_graph(&vor_cache, &s.graph_cache);
+        if let Err(e) = self.store.commit(
+            &mut s.payload,
+            &alte_meta,
+            &graph_updates,
+            s.key.as_ref().expect("developer key"),
+            "heal",
+            &[],
+            &vermerk,
+        ) {
+            self.session = None;
+            return Err(e);
+        }
+        s.journal.push(eintrag);
+        while s.journal.len() > kap {
+            s.journal.remove(0);
+        }
+        s.last = Instant::now();
+        Ok(json!({
+            "befehl": "echtes_wort", "x": x, "knoten": x_id,
+            "ring_entfernt": ring.is_some(),
+            "alias_entfernt": alias_ziel.is_some(),
+        }))
+    }
+
     /// Authenticated owner-only data import; no execution and no dialog feedback.
     pub fn train_file(&mut self, path: &Path, code: bool) -> Result<serde_json::Value> {
         use sha2::{Digest, Sha256};
@@ -622,6 +1180,7 @@ impl App {
             Engine::active_state(&s.payload.state, &s.graph_cache),
             s.payload.actions.clone(),
         )?;
+        let journiert_alt = s.graph_cache.clone();
         let old = s.engine.state.clone();
         let file_growth_budget = ACTIVATION_BUDGET.saturating_sub(s.engine.state.neuronen.len());
         let added = graph::grow(&mut s.engine.state, &ts, file_growth_budget);
@@ -640,6 +1199,56 @@ impl App {
         }
         Engine::merge_active(&mut s.graph_cache, &s.engine.state);
         s.payload.state = metadata_after(&old_metadata, &s.engine.state);
+        // The import is one learning move; its journal entry precedes the
+        // commit exactly like a dialog learning move.
+        let zeit = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let journal_seq = s
+            .payload
+            .op_journal_seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Journal voll"))?;
+        let eintrag = journal::eintrag(
+            journal_seq,
+            s.engine.state.interaktionen,
+            journal::ART_LEARN,
+            zeit,
+            journal::Ausschnitt {
+                cache: &journiert_alt,
+                meta: &old_metadata,
+            },
+            journal::Ausschnitt {
+                cache: &s.graph_cache,
+                meta: &s.payload.state,
+            },
+        )?;
+        // Kap.-24 integration gate: the import commits only when its diff
+        // satisfies the rule data; a reject restores the pre-import state
+        // exactly, so the source digest is not consumed either.
+        let gruende = crate::gate::verify(
+            &old_metadata,
+            &eintrag.ops,
+            &crate::gate::regeln(&s.engine.state),
+        );
+        if !gruende.is_empty() {
+            let nummer = old.interaktionen;
+            s.engine.state = old;
+            s.graph_cache = before;
+            s.payload.state = old_metadata;
+            if let Err(e) = gate_reject_vermerken(&mut self.store, s, nummer) {
+                self.session = None;
+                return Err(e);
+            }
+            bail!("{}", crate::gate::hinweis(&gruende));
+        }
+        let mut neuer_eintrag = None;
+        let mut vermerk = JournalVermerk::default();
+        if !eintrag.ops.is_empty() {
+            let kap = journal::kap(&s.engine.state);
+            self.store
+                .journal_append(s.key.as_ref().expect("developer key"), &eintrag, kap)?;
+            vermerk.bestaetigt = Some(journal_seq);
+            neuer_eintrag = Some(eintrag);
+        }
         let graph_updates = changed_graph(&before, &s.graph_cache);
         if let Err(e) = self.store.commit(
             &mut s.payload,
@@ -648,9 +1257,17 @@ impl App {
             s.key.as_ref().expect("developer key"),
             "file_import",
             &[],
+            &vermerk,
         ) {
             self.session = None;
             return Err(e);
+        }
+        if let Some(eintrag) = neuer_eintrag {
+            let kap = journal::kap(&s.engine.state);
+            s.journal.push(eintrag);
+            while s.journal.len() > kap {
+                s.journal.remove(0);
+            }
         }
         s.last = Instant::now();
         Ok(json!({"sha256":hash,"tokens":ts.len(),"new_neurons":added}))
@@ -690,10 +1307,16 @@ impl App {
             .session
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Gesperrt"))?;
+        // Crash recovery is reported once, honestly, at the first /status.
+        let hinweis = (self.verworfen_ungemeldet > 0)
+            .then(|| journal::verwurf_hinweis(self.verworfen_ungemeldet));
+        self.verworfen_ungemeldet = 0;
         let retrieval = crate::retrieval::RetrievalController::defaults()?;
-        Ok(
-            json!({"mode":if s.frozen{"frozen"}else{"developer"},"neurons":s.payload.graph_count,"active_nodes":s.graph_cache.nodes.len(),"active_edges":s.graph_cache.edges.values().map(|e|e.len()).sum::<usize>(),"interactions":s.engine.state.interaktionen,"prefetch":s.prefetch_status,"audit_entries":self.store.audit_len()?,"retrieval_handlers":retrieval.ordered_ids(),"feedback_counts":s.payload.state.extra.get("feedback_counts"),"feedback_available":s.feedback_target.is_some()}),
-        )
+        let mut out = json!({"mode":if s.frozen{"frozen"}else{"developer"},"neurons":s.payload.graph_count,"active_nodes":s.graph_cache.nodes.len(),"active_edges":s.graph_cache.edges.values().map(|e|e.len()).sum::<usize>(),"interactions":s.engine.state.interaktionen,"prefetch":s.prefetch_status,"audit_entries":self.store.audit_len()?,"retrieval_handlers":retrieval.ordered_ids(),"feedback_counts":s.payload.state.extra.get("feedback_counts"),"feedback_available":s.feedback_target.is_some(),"journal_länge":s.journal.len(),"journal_letzter":s.journal.last().map(|e| json!({"art":e.art,"nummer":e.interaktionsnummer,"seq":e.seq}))});
+        if let Some(hinweis) = hinweis {
+            out["systemhinweis"] = json!(hinweis);
+        }
+        Ok(out)
     }
 
     /// Stream a complete integrity check of every archived conversation block.
@@ -896,6 +1519,38 @@ impl App {
     }
 }
 
+#[cfg(test)]
+impl App {
+    /// Affected learning section (neurons, edges, extra runs) for exact
+    /// rollback assertions in the op-journal tests. Empty outgoing edge maps
+    /// are a paging artifact of the resident slice, not a persisted
+    /// difference, so the comparison view drops them.
+    pub(crate) fn test_abschnitt(&self) -> serde_json::Value {
+        let Some(s) = self.session.as_ref() else {
+            return serde_json::Value::Null;
+        };
+        let kanten: std::collections::BTreeMap<&str, _> = s
+            .engine
+            .state
+            .kanten
+            .iter()
+            .filter(|(_, ziele)| !ziele.is_empty())
+            .map(|(id, ziele)| (id.as_str(), ziele))
+            .collect();
+        json!({
+            "neuronen": s.engine.state.neuronen,
+            "kanten": kanten,
+            "extra": s.engine.state.extra,
+        })
+    }
+
+    /// Simulate a crash after the write-ahead journal append, before the
+    /// learning commit, leaving an unconfirmed entry for recovery.
+    pub(crate) fn test_crash_vor_commit(&mut self) {
+        self.store.crash_vor_commit = true;
+    }
+}
+
 const ACTIVATION_BUDGET: usize = 128;
 const ACTIVATION_PAGE: usize = 32;
 
@@ -906,6 +1561,82 @@ fn metadata_after(metadata: &State, active: &State) -> State {
     // Sequence statistics are learned controller data, not lexical graph rows.
     next.extra = active.extra.clone();
     next
+}
+
+/// Kap.-24 gate rejection bookkeeping: the refused move committed nothing,
+/// so the marker entry carries no ops. It is appended write-ahead and then
+/// confirmed by a bookkeeping commit of the UNCHANGED state — an
+/// unconfirmed marker would be discarded as a crash remnant at the next
+/// login, silently losing the honest rejection record. Like every journal
+/// entry it survives a reload, shows up in /status, and rolls back with
+/// /undo.
+fn gate_reject_vermerken(store: &mut Store, s: &mut Session, nummer: u64) -> Result<()> {
+    let zeit = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let journal_seq = s
+        .payload
+        .op_journal_seq
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("Journal voll"))?;
+    let eintrag = JournalEintrag {
+        seq: journal_seq,
+        interaktionsnummer: nummer,
+        art: journal::ART_INTEGRATION_REJECT.into(),
+        zeit,
+        ops: Vec::new(),
+    };
+    let kap = journal::kap(&s.payload.state);
+    store.journal_append(s.key.as_ref().expect("developer key"), &eintrag, kap)?;
+    let alt = s.payload.state.clone();
+    let vermerk = JournalVermerk {
+        bestaetigt: Some(journal_seq),
+        ..JournalVermerk::default()
+    };
+    store.commit(
+        &mut s.payload,
+        &alt,
+        &GraphSlice::default(),
+        s.key.as_ref().expect("developer key"),
+        "integration_reject",
+        &[],
+        &vermerk,
+    )?;
+    s.journal.push(eintrag);
+    while s.journal.len() > kap {
+        s.journal.remove(0);
+    }
+    Ok(())
+}
+
+/// Resolve a Kap.-21 heal command's word to its resident node id, loading
+/// the exact record from the vault on demand (bounded to that one record).
+/// Cold legacy punctuation spellings cannot be found by id and fail
+/// honestly, like every other resident-only lookup.
+fn wort_laden(s: &mut Session, store: &Store, wort: &str) -> Result<String> {
+    if let Some(id) = graph::wort_namentlich(&s.engine.state, wort) {
+        return Ok(id);
+    }
+    let id = format!("lex:{wort}");
+    let key = s
+        .key
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Anmeldung erforderlich"))?;
+    let page = store.graph_nodes(key, std::slice::from_ref(&id))?;
+    if !page.nodes.contains_key(&id) {
+        bail!("Wort ist nicht im Netz: {wort}");
+    }
+    for (knoten_id, knoten) in page.nodes {
+        if let Some(kanten) = page.edges.get(&knoten_id) {
+            s.graph_cache
+                .edges
+                .insert(knoten_id.clone(), kanten.clone());
+        }
+        s.graph_cache.nodes.insert(knoten_id, knoten);
+    }
+    s.engine = Engine::new(
+        Engine::active_state(&s.payload.state, &s.graph_cache),
+        s.payload.actions.clone(),
+    )?;
+    Ok(id)
 }
 
 fn changed_graph(before: &GraphSlice, after: &GraphSlice) -> GraphSlice {

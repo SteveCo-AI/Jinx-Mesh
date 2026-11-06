@@ -96,7 +96,7 @@ fn main() {
 fn run() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "--help" {
-        println!("Jinx 2.5.0\n  saeugling init VAULT [STATE_JSON ACTIONS_JSON [LEGACY_AUDIT]]\n  saeugling chat VAULT\nAnmeldedaten werden ausschließlich verdeckt im Terminal eingegeben.");
+        println!("Jinx 2.6.0\n  saeugling init VAULT [STATE_JSON ACTIONS_JSON [LEGACY_AUDIT]]\n  saeugling chat VAULT\nAnmeldedaten werden ausschließlich verdeckt im Terminal eingegeben.");
         return Ok(());
     }
     if args[0] == "init" {
@@ -187,7 +187,7 @@ fn run() -> Result<()> {
             };
         }
     });
-    println!("Gesperrt. /login | /freeze | /logout | /status | /recall [--strategy NAME] TEXT | /verify-archive | /verify-graph | /continue | /slaap | /train TEXTDATEI | /code CODEDATEI | /exit\nNach /login lernt jede normale Nachricht automatisch. /recall sucht in gespeicherten Gesprächsstellen; NAME ist lexical, contextual oder temporal. /verify-archive und /verify-graph prüfen alle gespeicherten Blöcke. /continue setzt budgetbegrenzte Graphaktivierung fort. /freeze stoppt Lernen; zum Fortsetzen erneut /login.");
+    println!("Gesperrt. /login | /freeze | /logout | /status | /recall [--strategy NAME] TEXT | /verify-archive | /verify-graph | /continue | /slaap | /undo [n|round] | /falsch | /echtes_wort | /train TEXTDATEI | /code CODEDATEI | /exit\nNach /login lernt jede normale Nachricht automatisch. /recall sucht in gespeicherten Gesprächsstellen; NAME ist lexical, contextual oder temporal. /verify-archive und /verify-graph prüfen alle gespeicherten Blöcke. /continue setzt budgetbegrenzte Graphaktivierung fort. /freeze stoppt Lernen; zum Fortsetzen erneut /login. /undo rollt den letzten Lernschritt zurück, /undo n die letzten n, /undo round die ganze Runde ab der letzten Konsolidierung. /falsch und /echtes_wort heilen falsch gelernte Worte nach dem in der Konfiguration stehenden Muster (heal_befehl_muster), nur im Schreib-Modus, jede Heilung landet im Journal und ist per /undo rückholbar.");
     loop {
         let line = match input_with_progress("> ", &progress_rx) {
             Ok(l) => l,
@@ -290,6 +290,25 @@ fn run() -> Result<()> {
             } else if command == "/slaap" {
                 let report = app.lock().unwrap().consolidate()?;
                 println!("Konsolidierung abgeschlossen: {report}");
+            } else if command == "/undo" {
+                println!("{}", app.lock().unwrap().undo(1)?);
+            } else if let Some(arg) = command.strip_prefix("/undo ") {
+                let arg = arg.trim();
+                if arg == "round" {
+                    println!("{}", app.lock().unwrap().undo_runde()?);
+                } else {
+                    let schritte: u64 = arg
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("Ungültige Schrittanzahl für /undo"))?;
+                    println!("{}", app.lock().unwrap().undo(schritte)?);
+                }
+            } else if let Some(argument) = command.strip_prefix("/falsch ") {
+                println!("{}", app.lock().unwrap().heal_befehl("falsch", argument)?);
+            } else if let Some(argument) = command.strip_prefix("/echtes_wort ") {
+                println!(
+                    "{}",
+                    app.lock().unwrap().heal_befehl("echtes_wort", argument)?
+                );
             } else if let Some(path) = command.strip_prefix("/train ") {
                 println!(
                     "{}",

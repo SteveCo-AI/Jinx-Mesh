@@ -114,6 +114,9 @@ impl State {
             "structure_observations",
             "context_feedback",
             "feedback_counts",
+            "anker_maturing",
+            "kanal2_letzte",
+            "fallback_pro_thema",
         ] {
             if let Some(value) = self.extra.get(name) {
                 if !value.is_object() {
@@ -128,6 +131,55 @@ impl State {
                     .is_none_or(|a| a.len() > 128 || a.iter().any(|v| !v.is_string()))
             {
                 bail!("Ungültiges Bewertungsziel");
+            }
+            // The Kap.-18 implicit channel compares the previous input's
+            // tokens; pre-Block-2 targets simply lack the field.
+            if let Some(eingabe) = target.get("eingabe") {
+                if eingabe
+                    .as_array()
+                    .is_none_or(|a| a.len() > 128 || a.iter().any(|v| !v.is_string()))
+                {
+                    bail!("Ungültiges Bewertungsziel");
+                }
+            }
+        }
+        // Learned current anchor weight; absent means the konfig start value.
+        if let Some(gewicht) = self.extra.get("anker_gewicht") {
+            let Some(gewicht) = gewicht.as_f64() else {
+                bail!("Ungültiges Anker-Gewicht");
+            };
+            if !gewicht.is_finite() || !(0.0..=2.0).contains(&gewicht) {
+                bail!("Ungültiges Anker-Gewicht");
+            }
+        }
+        // Kap.-18 channel-2 slot, filled by the Kap.-19 fallback flow: an open
+        // question and/or the latest recorded result value, both keyed by
+        // theme digest and interaction number.
+        if let Some(kanal2) = self.extra.get("kanal2_letzte") {
+            for feld in ["offen", "ergebnis"] {
+                let Some(eintrag) = kanal2.get(feld) else {
+                    continue;
+                };
+                if eintrag["thema"].as_str().is_none() || eintrag["runde"].as_u64().is_none() {
+                    bail!("Ungültige Kanal-2-Daten");
+                }
+                if feld == "ergebnis"
+                    && eintrag["worte"]
+                        .as_array()
+                        .is_none_or(|a| a.len() > 128 || a.iter().any(|v| !v.is_string()))
+                {
+                    bail!("Ungültige Kanal-2-Daten");
+                }
+            }
+        }
+        // Kap.-19 fallback bookkeeping: the per-theme question counter map and
+        // the scaffold rotation counter (usage counting).
+        if let Some(zaehler) = self.extra.get("fallback_geruest_zaehler") {
+            let Some(zaehler) = zaehler.as_f64() else {
+                bail!("Ungültiger Gerüst-Zähler");
+            };
+            if !zaehler.is_finite() || !(0.0..=1_000_000_000.0).contains(&zaehler) {
+                bail!("Ungültiger Gerüst-Zähler");
             }
         }
         for key in [
@@ -150,6 +202,336 @@ impl State {
                 bail!("Ungültige Konfiguration");
             }
         }
+        if let Some(value) = self.konfig.get("journal_kap") {
+            let Some(kap) = value.as_f64() else {
+                bail!("Ungültige Konfiguration: journal_kap");
+            };
+            if !kap.is_finite()
+                || !(crate::journal::KAP_MIN..=crate::journal::KAP_MAX).contains(&kap)
+            {
+                bail!("Ungültige Konfiguration: journal_kap");
+            }
+        }
+        // Kap.-18 anchor configuration. Every key stays optional so vaults
+        // predating the mechanism load unchanged; Engine::new restores the
+        // fixture defaults. The words are configuration data, never code
+        // strings, and each must be a single token.
+        for key in ["anker_plus", "anker_minus"] {
+            if let Some(wort) = self.konfig.get(key) {
+                if crate::language::parse(wort.as_str().unwrap_or(""))
+                    .words
+                    .len()
+                    != 1
+                {
+                    bail!("Ungültige Konfiguration: {key}");
+                }
+            }
+        }
+        if let (Some(plus), Some(minus)) = (
+            self.konfig.get("anker_plus").and_then(Value::as_str),
+            self.konfig.get("anker_minus").and_then(Value::as_str),
+        ) {
+            if crate::language::parse(plus).words == crate::language::parse(minus).words {
+                bail!("Anker-Wörter müssen verschieden sein");
+            }
+        }
+        for (key, bereich) in [
+            ("anker_gewicht", 0.0..=2.0),
+            ("anker_gewicht_min", 0.0..=2.0),
+            ("implizit_positiv", 0.0..=2.0),
+            ("anker_reif_schritt", 0.0..=1.0),
+            ("anker_reif_ueber_einstimmig", 0.0..=1.0),
+            ("anker_reif_fenster", 1.0..=10_000.0),
+        ] {
+            if let Some(value) = self.konfig.get(key) {
+                let Some(v) = value.as_f64() else {
+                    bail!("Ungültige Konfiguration: {key}");
+                };
+                if !v.is_finite() || !bereich.contains(&v) {
+                    bail!("Ungültige Konfiguration: {key}");
+                }
+            }
+        }
+        if let (Some(gewicht), Some(minimum)) = (
+            self.konfig.get("anker_gewicht").and_then(Value::as_f64),
+            self.konfig.get("anker_gewicht_min").and_then(Value::as_f64),
+        ) {
+            if minimum > gewicht {
+                bail!("anker_gewicht_min übersteigt anker_gewicht");
+            }
+        }
+        // Kap.-19 fallback configuration. Optional like the Kap.-18 keys so
+        // vaults predating the mechanism load unchanged; Engine::new restores
+        // the fixture defaults. The question scaffolds and status texts are
+        // configuration data, never code strings; each array carries several
+        // bounded non-empty variants so the rotation has data to choose from.
+        for (key, bereich) in [
+            ("fallback_unklar_min", 0.0..=2.0),
+            ("fallback_drossel_max", 1.0..=1000.0),
+        ] {
+            if let Some(value) = self.konfig.get(key) {
+                let Some(v) = value.as_f64() else {
+                    bail!("Ungültige Konfiguration: {key}");
+                };
+                if !v.is_finite() || !bereich.contains(&v) {
+                    bail!("Ungültige Konfiguration: {key}");
+                }
+            }
+        }
+        for key in ["fallback_frage_geruest", "fallback_status_durchsage"] {
+            if let Some(value) = self.konfig.get(key) {
+                let Some(varianten) = value.as_array() else {
+                    bail!("Ungültige Konfiguration: {key}");
+                };
+                if varianten.is_empty()
+                    || varianten.len() > 64
+                    || varianten
+                        .iter()
+                        .any(|v| v.as_str().is_none_or(|s| s.is_empty() || s.len() > 256))
+                {
+                    bail!("Ungültige Konfiguration: {key}");
+                }
+            }
+        }
+        // Kap.-21/22 self-healing configuration. Optional like the Kap.-18/19
+        // keys so vaults predating the mechanism load unchanged; Engine::new
+        // restores the fixture defaults. The command formulations in
+        // heal_befehl_muster are pattern data, never code strings.
+        for (key, bereich) in [
+            ("folding_schwelle", 0.0..=10.0),
+            ("folding_min_nutzt", 0.0..=1_000_000.0),
+            ("verdacht_schwelle", -1.0..=0.0),
+            ("verdacht_min_nutzt", 0.0..=1_000_000.0),
+            ("heil_schritt", 0.0..=1.0),
+            ("heil_schwelle_min", 0.0..=1.0),
+            ("heil_schwelle_max", 0.0..=1.0),
+        ] {
+            if let Some(value) = self.konfig.get(key) {
+                let Some(v) = value.as_f64() else {
+                    bail!("Ungültige Konfiguration: {key}");
+                };
+                if !v.is_finite() || !bereich.contains(&v) {
+                    bail!("Ungültige Konfiguration: {key}");
+                }
+            }
+        }
+        if let (Some(minimum), Some(maximum)) = (
+            self.konfig.get("heil_schwelle_min").and_then(Value::as_f64),
+            self.konfig.get("heil_schwelle_max").and_then(Value::as_f64),
+        ) {
+            if minimum > maximum {
+                bail!("heil_schwelle_min übersteigt heil_schwelle_max");
+            }
+        }
+        if let Some(muster) = self.konfig.get("heal_befehl_muster") {
+            let Some(muster) = muster.as_object() else {
+                bail!("Ungültige Konfiguration: heal_befehl_muster");
+            };
+            // The falsch pattern is "{x}<trenner>{y}" with a non-empty
+            // literal separator; the echtes_wort pattern is exactly "{x}".
+            for (key, mit_y) in [("falsch", true), ("echtes_wort", false)] {
+                let Some(text) = muster.get(key).and_then(Value::as_str) else {
+                    bail!("Ungültige Konfiguration: heal_befehl_muster");
+                };
+                if text.len() > 256
+                    || text.matches("{x}").count() != 1
+                    || text.matches("{y}").count() != usize::from(mit_y)
+                    || (mit_y
+                        && text
+                            .strip_prefix("{x}")
+                            .and_then(|rest| rest.strip_suffix("{y}"))
+                            .is_none_or(|trenner| {
+                                trenner.trim().is_empty() || trenner.contains('{')
+                            }))
+                {
+                    bail!("Ungültige Konfiguration: heal_befehl_muster");
+                }
+            }
+        }
+        // Kap.-24 integration-gate rule data: every declared column must be a
+        // known, well-shaped rule the gate registry can interpret — a
+        // declared rule that silently passes would be fake safety. The key
+        // is optional so vaults predating the gate load unchanged;
+        // Engine::new restores the fixture defaults.
+        if let Some(regeln) = self.konfig.get(crate::gate::KONFIG_KEY) {
+            if !crate::gate::konfig_pruefen(regeln) {
+                bail!("Ungültige Konfiguration: gate_regeln");
+            }
+        }
+        // Kap.-21 learned folding-threshold override (a user correction raised
+        // the effective distance; the konfig value stays the start value).
+        if let Some(value) = self.extra.get("folding_schwelle") {
+            let Some(v) = value.as_f64() else {
+                bail!("Ungültige Folding-Schwelle");
+            };
+            if !v.is_finite() || !(0.0..=10.0).contains(&v) {
+                bail!("Ungültige Folding-Schwelle");
+            }
+        }
+        // Kap.-22 verification-source registry: per level a source designator
+        // (data, possibly empty — a level without a source simply may not
+        // heal), a verification credit counter, and the level's heal threshold.
+        if let Some(registry) = self.extra.get("verifikations_ebenen") {
+            let Some(ebenen) = registry.as_object() else {
+                bail!("Ungültige Verifikations-Ebenen");
+            };
+            if ebenen.len() > 16 {
+                bail!("Ungültige Verifikations-Ebenen");
+            }
+            for eintrag in ebenen.values() {
+                let Some(felder) = eintrag.as_object() else {
+                    bail!("Ungültige Verifikations-Ebenen");
+                };
+                if let Some(quelle) = felder.get("quelle") {
+                    if quelle.as_str().is_none() {
+                        bail!("Ungültige Verifikations-Ebenen");
+                    }
+                }
+                let Some(credit) = felder.get("verification_credit") else {
+                    bail!("Ungültige Verifikations-Ebenen");
+                };
+                if credit.as_u64().is_none() {
+                    bail!("Ungültige Verifikations-Ebenen");
+                }
+                let Some(schwelle) = felder.get("heil_schwelle") else {
+                    bail!("Ungültige Verifikations-Ebenen");
+                };
+                let Some(schwelle) = schwelle.as_f64() else {
+                    bail!("Ungültige Verifikations-Ebenen");
+                };
+                if !schwelle.is_finite() || !(0.0..=1.0).contains(&schwelle) {
+                    bail!("Ungültige Verifikations-Ebenen");
+                }
+            }
+        }
+        // Kap.-21 folding aliases and the Kap.-21 suspicion ledger keep their
+        // shape checkable so vaulted metadata stays honest.
+        if let Some(alias) = self.extra.get("neuron_aliases") {
+            let Some(alias) = alias.as_object() else {
+                bail!("Ungültige Neuron-Aliase");
+            };
+            if alias.values().any(|v| v.as_str().is_none()) {
+                bail!("Ungültige Neuron-Aliase");
+            }
+        }
+        if let Some(verzeichnis) = self.extra.get("verdachtsverzeichnis") {
+            if verzeichnis.as_array().is_none() {
+                bail!("Ungültiges Verdachtsverzeichnis");
+            }
+        }
+        // Phase-2.5 mutation configuration (novelty operator). Optional like
+        // the Kap.-18/19 keys so vaults predating the layer load unchanged;
+        // Engine::new restores the fixture defaults. Every switch and
+        // threshold is data — the layer is disarmed by default (SICHERHEIT:
+        // proposals only, konservativ).
+        if let Some(value) = self.konfig.get("mutation_aktivier") {
+            if value.as_bool().is_none() {
+                bail!("Ungültige Konfiguration: mutation_aktivier");
+            }
+        }
+        for (key, bereich) in [
+            ("mutation_rate", 0.0..=1.0),
+            ("mutation_temperatur", 0.0..=1.0),
+            ("mutation_schwellwert", 0.0..=1.0),
+            ("mutation_langeweile_schwelle", 0.0..=1.0),
+            ("mutation_wildheit_schritt", 0.0..=1.0),
+            ("mutation_langeweile_ab_versuchen", 1.0..=1000.0),
+        ] {
+            if let Some(value) = self.konfig.get(key) {
+                let Some(v) = value.as_f64() else {
+                    bail!("Ungültige Konfiguration: {key}");
+                };
+                if !v.is_finite() || !bereich.contains(&v) {
+                    bail!("Ungültige Konfiguration: {key}");
+                }
+            }
+        }
+        // Phase-2.5 mutation bookkeeping: shape-checked so vaulted metadata
+        // stays honest. The wegweiser learns environments (never words), the
+        // memory ledger keeps every mutant's fate, the balance counts the
+        // external-signal-only festigungen, and the pending candidate carries
+        // the proposal awaiting its signal.
+        if let Some(wegweiser) = self.extra.get("mutations_wegweiser") {
+            let Some(eintraege) = wegweiser.as_object() else {
+                bail!("Ungültiger Mutations-Wegweiser");
+            };
+            if eintraege.len() > 4096 {
+                bail!("Ungültiger Mutations-Wegweiser");
+            }
+            for eintrag in eintraege.values() {
+                let (Some(versuche), Some(erfolge)) =
+                    (eintrag["versuche"].as_u64(), eintrag["erfolge"].as_u64())
+                else {
+                    bail!("Ungültiger Mutations-Wegweiser");
+                };
+                if erfolge > versuche {
+                    bail!("Ungültiger Mutations-Wegweiser");
+                }
+            }
+        }
+        if let Some(wildheit) = self.extra.get("mutation_wildheit") {
+            let Some(wildheit) = wildheit.as_f64() else {
+                bail!("Ungültige Mutations-Wildheit");
+            };
+            if !wildheit.is_finite() || !(0.0..=1.0).contains(&wildheit) {
+                bail!("Ungültige Mutations-Wildheit");
+            }
+        }
+        if let Some(bilanz) = self.extra.get("mutation_bilanz") {
+            let Some(felder) = bilanz.as_object() else {
+                bail!("Ungültige Mutations-Bilanz");
+            };
+            for feld in [
+                "versuche",
+                "verworfen",
+                "festigungen",
+                "negativ",
+                "verfallen",
+            ] {
+                if felder.get(feld).is_some_and(|v| v.as_u64().is_none()) {
+                    bail!("Ungültige Mutations-Bilanz");
+                }
+            }
+        }
+        if let Some(kandidat) = self.extra.get("mutation_kandidat") {
+            if kandidat["wort"]
+                .as_str()
+                .is_none_or(|w| w.is_empty() || w.len() > 1024)
+                || kandidat["kontext"]
+                    .as_str()
+                    .is_none_or(|c| c.is_empty() || c.len() > 128)
+                || kandidat["stelle"].as_u64().is_none_or(|s| s > 128)
+                || kandidat["runde"].as_u64().is_none()
+            {
+                bail!("Ungültiger Mutations-Kandidat");
+            }
+            for feld in ["prev", "next"] {
+                if let Some(wort) = kandidat[feld].as_str() {
+                    if wort.is_empty() || wort.len() > 1024 {
+                        bail!("Ungültiger Mutations-Kandidat");
+                    }
+                }
+            }
+        }
+        if let Some(memory) = self.extra.get("mutations_memory") {
+            let Some(liste) = memory.as_array() else {
+                bail!("Ungültiges Mutations-Memory");
+            };
+            if liste.len() > 256
+                || liste.iter().any(|eintrag| {
+                    eintrag.as_object().is_none_or(|e| {
+                        e.get("schicksal")
+                            .and_then(Value::as_str)
+                            .is_none_or(|s| s.len() > 32)
+                            || e.get("wort")
+                                .and_then(Value::as_str)
+                                .is_none_or(|w| w.is_empty() || w.len() > 1024)
+                    })
+                })
+            {
+                bail!("Ungültiges Mutations-Memory");
+            }
+        }
         if !(1.0..=128.0).contains(&self.number("max_pfad_len"))
             || self.number("max_neu_pro_nachricht") > 128.0
             || self.number("auto_slaap_ab") < 1.0
@@ -163,6 +545,18 @@ impl State {
 pub struct Reply {
     #[serde(default)]
     pub feedback: Option<i8>,
+    /// Kap.-18 anchor word that fired in this move (konfig data, not code).
+    #[serde(default)]
+    pub anker: Option<String>,
+    /// Kap.-19 fallback utterance appended to this move: "nachfrage" or
+    /// "durchsage" (mechanical marker, never behavior text).
+    #[serde(default)]
+    pub fallback: Option<String>,
+    /// Phase-2.5 mutation proposal in this answer: the inserted word (a
+    /// learned or fresh word from data, never a code string). None when the
+    /// layer is disarmed, rate-limited, or the mutant failed selection.
+    #[serde(default)]
+    pub mutation: Option<String>,
     pub text: String,
     pub art: String,
     pub aktion: Option<String>,

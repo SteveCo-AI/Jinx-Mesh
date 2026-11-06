@@ -10,6 +10,65 @@ use serde_json::Value;
 pub(crate) struct Engine {
     pub state: State,
 }
+
+/// Kap.-18 anchor configuration keys restored from the fixture state.
+const KAP18_KONFIG: [&str; 8] = [
+    "anker_gewicht",
+    "anker_gewicht_min",
+    "anker_minus",
+    "anker_plus",
+    "anker_reif_fenster",
+    "anker_reif_schritt",
+    "anker_reif_ueber_einstimmig",
+    "implizit_positiv",
+];
+
+/// Kap.-19 fallback configuration keys restored from the fixture state.
+const KAP19_KONFIG: [&str; 4] = [
+    "fallback_drossel_max",
+    "fallback_frage_geruest",
+    "fallback_status_durchsage",
+    "fallback_unklar_min",
+];
+
+/// Kap.-21/22 self-healing configuration keys restored from the fixture
+/// state (the command formulations in heal_befehl_muster are pattern data).
+const KAP21_KONFIG: [&str; 8] = [
+    "folding_min_nutzt",
+    "folding_schwelle",
+    "heal_befehl_muster",
+    "heil_schritt",
+    "heil_schwelle_max",
+    "heil_schwelle_min",
+    "verdacht_min_nutzt",
+    "verdacht_schwelle",
+];
+
+/// Kap.-24 integration-gate rule data restored from the fixture state (the
+/// gate interprets the JSON columns; no rule value lives in code).
+const KAP24_KONFIG: [&str; 1] = ["gate_regeln"];
+
+/// Phase-2.5 mutation configuration keys restored from the fixture state
+/// (the novelty operator's switches and thresholds are data, never code).
+const KAP25_KONFIG: [&str; 7] = crate::mutation::KONFIG;
+
+/// Fill any missing konfig keys from the fixture state so vaults predating a
+/// mechanism load with its configured defaults.
+fn konfig_ergaenzen(state: &mut State, keys: &[&str]) {
+    if keys.iter().any(|key| !state.konfig.contains_key(*key)) {
+        let standard = State::empty();
+        for key in keys {
+            if !state.konfig.contains_key(*key) {
+                let wert = standard
+                    .konfig
+                    .get(*key)
+                    .expect("Konfiguration in den Startwerten")
+                    .clone();
+                state.konfig.insert((*key).into(), wert);
+            }
+        }
+    }
+}
 impl Engine {
     pub fn new(mut state: State, _legacy_spec: Value) -> Result<Self> {
         state.validate()?;
@@ -20,6 +79,31 @@ impl Engine {
                 state.konfig.insert(key.into(), serde_json::json!(128));
             }
         }
+        // Vaults predating the op-journal lack the cap; normalize it in the
+        // active state so every reader sees the configured value.
+        if !state.konfig.contains_key("journal_kap") {
+            state.konfig.insert(
+                "journal_kap".into(),
+                serde_json::json!(crate::journal::KAP_STANDARD),
+            );
+        }
+        // Vaults predating the Kap.-18 anchor mechanism and the Kap.-19
+        // fallback lack their konfig keys. The fixture state is the single
+        // data source for the defaults (the anchor words and the fallback
+        // scaffolds are configuration data, never code strings), so every
+        // reader sees a complete mechanism.
+        konfig_ergaenzen(&mut state, &KAP18_KONFIG);
+        konfig_ergaenzen(&mut state, &KAP19_KONFIG);
+        // Same for the Kap.-21/22 heal keys (the dialog heal patterns are
+        // configuration data); the verification-source registry itself lives
+        // in state.extra and falls back to the fixture defaults at read time.
+        konfig_ergaenzen(&mut state, &KAP21_KONFIG);
+        // Same for the Kap.-24 integration-gate rule columns (pure data;
+        // the gate interprets them, the code carries no rule value).
+        konfig_ergaenzen(&mut state, &KAP24_KONFIG);
+        // Same for the Phase-2.5 novelty operator (pure data; the layer is
+        // disarmed by default and arms only through the vault's konfig).
+        konfig_ergaenzen(&mut state, &KAP25_KONFIG);
         Ok(Self { state })
     }
     pub fn infer(&self, text: &str) -> Result<Reply> {
@@ -46,6 +130,9 @@ impl Engine {
             neue_neuronen: 0,
             activation: None,
             feedback: None,
+            anker: None,
+            fallback: None,
+            mutation: None,
         })
     }
     #[cfg(test)]
@@ -57,17 +144,31 @@ impl Engine {
     pub(crate) fn train_with_source(&mut self, text: &str, source_id: &str) -> Result<Reply> {
         validate_text(text)?;
         let (feedback, text) = language::split_feedback(text);
+        let parsed = language::parse(text);
+        let tokens = parsed.words.clone();
+        // Kap. 18: this move also rates the previous response through the
+        // configured anchor word and the implicit channel. The explicit +/-
+        // rating below consumes the stored target, so both the target and
+        // the signals are read before it runs.
+        let ziel = self.state.extra.get("feedback_target").cloned();
+        let signale = language::signale_lesen(&self.state, &tokens, feedback, ziel.as_ref());
         if let Some(value) = feedback {
             language::apply_feedback(&mut self.state, value)?;
         }
-        let parsed = language::parse(text);
-        let tokens = parsed.words.clone();
+        language::signale_anwenden(&mut self.state, &signale, ziel.as_ref())?;
+        // Phase 2.5: the pending mutant is decided ONLY by this move's
+        // external signals — the layer never rewards its own proposal
+        // (model-collapse protection, binding).
+        crate::mutation::bewerten(&mut self.state, &signale, feedback, ziel.as_ref());
         let had_known = tokens.iter().any(|t| graph::word(&self.state, t).is_some());
         self.state.interaktionen = self
             .state
             .interaktionen
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("Interaktionslimit"))?;
+        // Kap. 19: when the previous move left an open question, this input is
+        // its answer — record it as the channel-2 result value.
+        language::kanal2_notieren(&mut self.state, &tokens);
         let budget = (self.state.number("max_neu_pro_nachricht") as usize)
             .min(128usize.saturating_sub(self.state.neuronen.len()));
         let added = graph::grow(&mut self.state, &tokens, budget);
@@ -94,19 +195,60 @@ impl Engine {
                 }
             }
         }
+        let kontext = language::context(text);
         let path = graph::path_with_context(
             &self.state,
             &graph::starts(&self.state, &tokens),
-            Some(&language::context(text)),
+            Some(&kontext),
         );
-        let output = if !had_known {
+        let mut output = if !had_known {
             language::render(&tokens, &parsed.marks)
         } else {
             path.as_ref()
-                .map(|p| language::render_path(&self.state, &p.nodes, &language::context(text)))
+                .map(|p| language::render_path(&self.state, &p.nodes, &kontext))
                 .unwrap_or_default()
         };
+        // Phase 2.5 novelty operator: at most one proposed word insertion
+        // per answer, judged by the main net before anything structural
+        // changes. A frozen or locked mode never reaches this code — it
+        // lives exclusively in the training move.
+        let mut mutation = None;
         if !output.is_empty() {
+            if let Some(vorschlag) =
+                crate::mutation::schritt(&mut self.state, &kontext, &tokens, &output)
+            {
+                output = vorschlag.text;
+                mutation = Some(vorschlag.wort);
+            }
+        }
+        // Kap. 19: with no anchor word and no explicit rating in this move, a
+        // contradictory signal appends ONE fallback utterance to the normal
+        // answer instead of leaving another bare guess.
+        let mut fallback = None;
+        if feedback.is_none() && signale.anker.is_none() && !output.is_empty() {
+            if let Some((aeusserung, durchsage)) = language::fallback_schritt(
+                &mut self.state,
+                &kontext,
+                &tokens,
+                &language::parse(&output).words,
+            ) {
+                output = format!("{output} {aeusserung}");
+                fallback = Some(if durchsage {
+                    "durchsage".to_owned()
+                } else {
+                    "nachfrage".to_owned()
+                });
+                // The fallback utterance is never the rateable target: no
+                // rating, repetition comparison, or anchor maturation may
+                // consume it, and the user's next move learns normally.
+                self.state.extra.remove("feedback_target");
+                // Phase 2.5: a fallback answer is never rateable either, so
+                // its pending proposal expires unverwertet — no festigung
+                // can ever reach it.
+                crate::mutation::verfallen(&mut self.state);
+            }
+        }
+        if !output.is_empty() && fallback.is_none() {
             language::remember(&mut self.state, text, &output);
         }
         if let Some(path) = path {
@@ -132,6 +274,9 @@ impl Engine {
             neue_neuronen: added,
             activation: None,
             feedback,
+            anker: signale.anker.map(|(wort, _)| wort),
+            fallback,
+            mutation,
         })
     }
 
