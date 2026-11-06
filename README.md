@@ -205,6 +205,11 @@ cargo clippy --locked --all-targets -- -D warnings
 Security details and operational limitations are in `docs/SECURITY.md`.
 Validation results are recorded in `docs/VALIDATION.md`.
 
+Training Jinx-Mesh: the current training guide, reproducible experiments, and
+versioned learning findings live in `docs/TRAINING.md`,
+`docs/TRAINING-EXPERIMENTS.md`, and `docs/TRAINING-FINDINGS.md`. Each names
+the model version, commit, and validity scope it was measured against.
+
 To measure vault creation, login, steady chat time, and peak resident memory on
 your own machine, run `./scripts/benchmark.sh`. It builds only the benchmark
 example with two parallel build jobs and reports these measurements separately;
