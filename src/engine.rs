@@ -1,5 +1,5 @@
 use crate::{
-    graph,
+    graph, language,
     model::{GraphSlice, Reply, State},
 };
 use anyhow::{bail, Result};
@@ -25,17 +25,15 @@ impl Engine {
     pub fn infer(&self, text: &str) -> Result<Reply> {
         validate_text(text)?;
         let tokens = graph::tokens(text);
-        let path = graph::path(&self.state, &graph::starts(&self.state, &tokens));
+        let path = graph::path_with_context(
+            &self.state,
+            &graph::starts(&self.state, &tokens),
+            Some(&language::context(text)),
+        );
         Ok(Reply {
             text: path
                 .as_ref()
-                .map(|p| {
-                    p.nodes
-                        .iter()
-                        .map(|id| self.state.neuronen[id].label.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
+                .map(|p| language::render_path(&self.state, &p.nodes, &language::context(text)))
                 .unwrap_or_default(),
             art: if path.is_some() {
                 "inferenz"
@@ -47,6 +45,7 @@ impl Engine {
             gelernt: false,
             neue_neuronen: 0,
             activation: None,
+            feedback: None,
         })
     }
     #[cfg(test)]
@@ -57,7 +56,12 @@ impl Engine {
 
     pub(crate) fn train_with_source(&mut self, text: &str, source_id: &str) -> Result<Reply> {
         validate_text(text)?;
-        let tokens = graph::tokens(text);
+        let (feedback, text) = language::split_feedback(text);
+        if let Some(value) = feedback {
+            language::apply_feedback(&mut self.state, value)?;
+        }
+        let parsed = language::parse(text);
+        let tokens = parsed.words.clone();
         let had_known = tokens.iter().any(|t| graph::word(&self.state, t).is_some());
         self.state.interaktionen = self
             .state
@@ -68,6 +72,7 @@ impl Engine {
             .min(128usize.saturating_sub(self.state.neuronen.len()));
         let added = graph::grow(&mut self.state, &tokens, budget);
         graph::hear(&mut self.state, &tokens);
+        language::observe(&mut self.state, &parsed);
         for token in &tokens {
             if let Some(id) = graph::word(&self.state, token) {
                 let node = self
@@ -89,20 +94,21 @@ impl Engine {
                 }
             }
         }
-        let path = graph::path(&self.state, &graph::starts(&self.state, &tokens));
+        let path = graph::path_with_context(
+            &self.state,
+            &graph::starts(&self.state, &tokens),
+            Some(&language::context(text)),
+        );
         let output = if !had_known {
-            tokens.join(" ")
+            language::render(&tokens, &parsed.marks)
         } else {
             path.as_ref()
-                .map(|p| {
-                    p.nodes
-                        .iter()
-                        .map(|id| self.state.neuronen[id].label.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
+                .map(|p| language::render_path(&self.state, &p.nodes, &language::context(text)))
                 .unwrap_or_default()
         };
+        if !output.is_empty() {
+            language::remember(&mut self.state, text, &output);
+        }
         if let Some(path) = path {
             for id in path.nodes {
                 let n = self.state.neuronen.get_mut(&id).unwrap();
@@ -125,6 +131,7 @@ impl Engine {
             gelernt: true,
             neue_neuronen: added,
             activation: None,
+            feedback,
         })
     }
 

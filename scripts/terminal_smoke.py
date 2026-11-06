@@ -25,10 +25,11 @@ with tempfile.TemporaryDirectory() as tmp:
     assert 'du bist jinx ich bin lumen wichtig ist augenhöhe' in child.before
     assert 'projekt alpha' not in child.before
     assert 'kundenblick' not in child.before
-    child.sendline('/status');child.expect('"interactions":1');child.expect('> ')
+    child.sendline('+ Mein Architekt heißt Lumen.');child.expect('Positive Bewertung gespeichert.');child.expect('> ')
+    child.sendline('/status');child.expect('"interactions":2');child.expect('> ')
     child.sendline('/freeze');child.expect('Eingefroren:');child.expect('> ')
     child.sendline('andereswort');child.expect('> ')
-    child.sendline('/status');child.expect('"interactions":1');child.expect('> ')
+    child.sendline('/status');child.expect('"interactions":2');child.expect('> ')
     child.sendline('/logout');child.expect('Gesperrt.');child.expect('> ')
     child.sendline('/exit');child.expect(pexpect.EOF);child.close();assert child.exitstatus==0
 print('PASS: real terminal init, hidden passwords, login, continuous learning, freeze, logout, exit')

@@ -39,6 +39,7 @@ struct Session {
     prefetch_status: Option<ActivationStatus>,
     key: Option<Key>,
     read_key: Option<Key>,
+    feedback_target: Option<serde_json::Value>,
     payload: Payload,
     started: Instant,
     last: Instant,
@@ -208,6 +209,7 @@ impl App {
             prefetch_status: None,
             key: Some(key),
             read_key: None,
+            feedback_target: payload.state.extra.get("feedback_target").cloned(),
             payload,
             started: Instant::now(),
             last: Instant::now(),
@@ -235,6 +237,53 @@ impl App {
         s.last = Instant::now();
         Ok(())
     }
+    /// Evaluate learned connections without training, archive, or checkpoint writes.
+    pub fn infer_read_only(&mut self, text: &str) -> Result<Reply> {
+        self.infer_read_only_with_progress(text, |_| {})
+    }
+
+    fn infer_read_only_with_progress<F>(&mut self, text: &str, mut progress: F) -> Result<Reply>
+    where
+        F: FnMut(&ActivationStatus),
+    {
+        if graph::tokens(text).len() > ACTIVATION_BUDGET || text.len() > 16384 {
+            bail!("Nachricht überschreitet das Inferenzbudget");
+        }
+        self.tick();
+        let s = self
+            .session
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Gesperrt: zuerst /login"))?;
+        let key = s.key.as_ref().or(s.read_key.as_ref()).expect("session key");
+        let (records, mut activation, _, _, _) = activate_graph(
+            &self.store,
+            key,
+            &s.payload.state,
+            text,
+            None,
+            None,
+            &mut progress,
+            4,
+        )?;
+        // Read-only inference uses no persisted checkpoint, audit, or archive writes.
+        activation.can_continue = false;
+        s.graph_cache = records;
+        s.engine = Engine::new(
+            Engine::active_state(&s.payload.state, &s.graph_cache),
+            s.payload.actions.clone(),
+        )?;
+        let mut r = s.engine.infer(text)?;
+        s.prefetch_status = Some(activation.clone());
+        r.activation = Some(activation);
+        s.feedback_target = if r.text.is_empty() {
+            None
+        } else {
+            Some(crate::language::target(text, &r.text))
+        };
+        s.last = Instant::now();
+        Ok(r)
+    }
+
     pub fn message(&mut self, text: &str) -> Result<Reply> {
         self.message_with_progress(text, |_| {})
     }
@@ -243,6 +292,11 @@ impl App {
     where
         F: FnMut(&ActivationStatus),
     {
+        let raw_text = text;
+        let (feedback, text) = crate::language::split_feedback(text);
+        if raw_text.len() > 16384 {
+            bail!("Nachricht zu lang (16384 UTF-8-Bytes)");
+        }
         if graph::tokens(text).len() > ACTIVATION_BUDGET {
             bail!("Nachricht überschreitet das Aktivierungsbudget von 128 Wörtern");
         }
@@ -252,29 +306,10 @@ impl App {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Gesperrt: zuerst /login"))?;
         if s.frozen {
-            let key = s.read_key.as_ref().expect("frozen read key");
-            let (records, mut activation, _, _, _) = activate_graph(
-                &self.store,
-                key,
-                &s.payload.state,
-                text,
-                None,
-                None,
-                &mut progress,
-                4,
-            )?;
-            // Read-only inference uses no persisted checkpoint, audit, or archive writes.
-            activation.can_continue = false;
-            s.graph_cache = records;
-            s.engine = Engine::new(
-                Engine::active_state(&s.payload.state, &s.graph_cache),
-                s.payload.actions.clone(),
-            )?;
-            let mut r = s.engine.infer(text)?;
-            s.prefetch_status = Some(activation.clone());
-            r.activation = Some(activation);
-            s.last = Instant::now();
-            return Ok(r);
+            if feedback.is_some() {
+                bail!("Bewertungen sind nur im DEV-Modus erlaubt");
+            }
+            return self.infer_read_only_with_progress(text, progress);
         }
         let key = s.key.as_ref().expect("developer key");
         let old_metadata = s.payload.state.clone();
@@ -299,11 +334,19 @@ impl App {
             Engine::active_state(&s.payload.state, &s.graph_cache),
             s.payload.actions.clone(),
         )?;
+        if let Some(target) = &s.feedback_target {
+            s.engine
+                .state
+                .extra
+                .insert("feedback_target".into(), target.clone());
+        } else {
+            s.engine.state.extra.remove("feedback_target");
+        }
         let old = s.engine.state.clone();
         let archive_user_id = s.payload.archive_count.saturating_add(1);
         let result = s
             .engine
-            .train_with_source(text, &format!("episode:{archive_user_id}"));
+            .train_with_source(raw_text, &format!("episode:{archive_user_id}"));
         match result {
             Ok(reply) => {
                 // Keep exact utterances in paged encrypted archive blocks, outside the
@@ -312,7 +355,7 @@ impl App {
                 let seq = s.engine.state.interaktionen;
                 let archive_reply_id = archive_user_id.saturating_add(1);
                 let archived = vec![
-                    json!({"id":format!("episode:{archive_user_id}"),"sequence":seq,"unix_time":now,"speaker":"user","text":text}),
+                    json!({"id":format!("episode:{archive_user_id}"),"sequence":seq,"unix_time":now,"speaker":"user","text":raw_text}),
                     json!({"id":format!("reply:{archive_reply_id}"),"sequence":seq,"unix_time":now,"speaker":"assistant","text":reply.text}),
                 ];
                 Engine::merge_active(&mut s.graph_cache, &s.engine.state);
@@ -330,6 +373,7 @@ impl App {
                     self.session = None;
                     return Err(e);
                 }
+                s.feedback_target = s.engine.state.extra.get("feedback_target").cloned();
                 let mut reply = reply;
                 let mut activation = activation;
                 activation.source_matches = source_matches(text, &episodes);
@@ -407,6 +451,11 @@ impl App {
             s.payload.actions.clone(),
         )?;
         let mut reply = s.engine.infer(&checkpoint.query)?;
+        s.feedback_target = if reply.text.is_empty() {
+            None
+        } else {
+            Some(crate::language::target(&checkpoint.query, &reply.text))
+        };
         let mut activation = activation;
         activation.source_matches = source_matches(&checkpoint.query, &episodes);
         reply.activation = Some(activation);
@@ -577,6 +626,9 @@ impl App {
         let file_growth_budget = ACTIVATION_BUDGET.saturating_sub(s.engine.state.neuronen.len());
         let added = graph::grow(&mut s.engine.state, &ts, file_growth_budget);
         graph::hear(&mut s.engine.state, &ts);
+        if !code {
+            crate::language::observe(&mut s.engine.state, &crate::language::parse(text));
+        }
         s.engine
             .state
             .extra
@@ -640,7 +692,7 @@ impl App {
             .ok_or_else(|| anyhow::anyhow!("Gesperrt"))?;
         let retrieval = crate::retrieval::RetrievalController::defaults()?;
         Ok(
-            json!({"mode":if s.frozen{"frozen"}else{"developer"},"neurons":s.payload.graph_count,"active_nodes":s.graph_cache.nodes.len(),"active_edges":s.graph_cache.edges.values().map(|e|e.len()).sum::<usize>(),"interactions":s.engine.state.interaktionen,"prefetch":s.prefetch_status,"audit_entries":self.store.audit_len()?,"retrieval_handlers":retrieval.ordered_ids()}),
+            json!({"mode":if s.frozen{"frozen"}else{"developer"},"neurons":s.payload.graph_count,"active_nodes":s.graph_cache.nodes.len(),"active_edges":s.graph_cache.edges.values().map(|e|e.len()).sum::<usize>(),"interactions":s.engine.state.interaktionen,"prefetch":s.prefetch_status,"audit_entries":self.store.audit_len()?,"retrieval_handlers":retrieval.ordered_ids(),"feedback_counts":s.payload.state.extra.get("feedback_counts"),"feedback_available":s.feedback_target.is_some()}),
         )
     }
 
@@ -941,6 +993,7 @@ fn activate_graph(
             anchors.push(id);
         }
     }
+    let lexical_anchors = anchors.clone();
     if let Some(checkpoint) = resume {
         for token in graph::tokens(&checkpoint.provisional).into_iter().take(32) {
             let id = format!("lex:{token}");
@@ -982,6 +1035,33 @@ fn activate_graph(
         });
     }
 
+    // Resolve only missing canonical words through old punctuation spellings.
+    // This is optional compatibility I/O inside the same page budget.
+    let aliases: Vec<String> = lexical_anchors
+        .iter()
+        .filter(|id| !records.nodes.contains_key(*id))
+        .flat_map(|id| {
+            [".", ",", "!", "?", ":", ";", "…"]
+                .into_iter()
+                .map(move |suffix| format!("{id}{suffix}"))
+        })
+        .take(ACTIVATION_BUDGET)
+        .collect();
+    for chunk in aliases.chunks(ACTIVATION_PAGE) {
+        if pages_loaded >= page_limit {
+            break;
+        }
+        let page = store.graph_nodes(key, chunk)?;
+        pages_loaded += 1;
+        frontier.extend(
+            page.nodes
+                .keys()
+                .filter(|id| !frontier.contains(*id))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        merge_slice(&mut records, page, ACTIVATION_BUDGET);
+    }
     // A missing keyed record was checked and is genuinely absent, so it does
     // not need to occupy the continuation frontier. It may be learned as a new
     // node later in this message.
@@ -993,9 +1073,15 @@ fn activate_graph(
     visited.extend(missing_anchors.iter().cloned());
     frontier.retain(|id| !missing_anchors.contains(id));
 
-    let reserved_unknown = anchors
+    let reserved_unknown = lexical_anchors
         .iter()
-        .filter(|id| !records.nodes.contains_key(*id))
+        .filter(|id| {
+            !records.nodes.contains_key(*id)
+                && !records.nodes.values().any(|n| {
+                    graph::tokens(&n.label).first()
+                        == id.strip_prefix("lex:").map(str::to_owned).as_ref()
+                })
+        })
         .count();
     let activation_cap = ACTIVATION_BUDGET.saturating_sub(reserved_unknown);
     while !frontier.is_empty() && records.nodes.len() < activation_cap && pages_loaded < page_limit

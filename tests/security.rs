@@ -327,7 +327,7 @@ fn default_creation_is_empty_and_authentication_does_not_seed_it() {
     app.login("lumen", PASS, None).unwrap();
     assert_eq!(app.status().unwrap()["neurons"], 0);
     let r = app.message("Du bist Jinx ich bin Lumen").unwrap();
-    assert_eq!(r.text, "du bist jinx ich bin lumen");
+    assert_eq!(r.text, "du bist jinx ich bin lumen.");
     assert_eq!(r.aktion, None);
     app.freeze().unwrap();
     let r = app.message("wichtig").unwrap();
@@ -363,4 +363,53 @@ fn frozen_inference_reloads_cold_graph_without_learning_or_disk_writes() {
     assert_eq!(std::fs::read(&db).unwrap(), before);
     app.logout();
     assert!(app.message("kaltwort").is_err());
+}
+
+#[test]
+fn evaluation_does_not_train_or_write_in_developer_mode() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("model.db");
+    let mut app = create(dir.path());
+    app.login("lumen", PASS, None).unwrap();
+    app.message("testwort erinnert verbindung.").unwrap();
+    let before = std::fs::read(&db).unwrap();
+    let count = app.status().unwrap()["interactions"].clone();
+    assert!(!app.infer_read_only("testwort").unwrap().gelernt);
+    assert_eq!(std::fs::read(&db).unwrap(), before);
+    assert_eq!(app.status().unwrap()["interactions"], count);
+    assert_eq!(app.mode(), Mode::Developer);
+    assert!(app.message("weiter lernen").unwrap().gelernt);
+}
+
+#[test]
+fn signed_feedback_persists_and_freeze_cannot_apply_it() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("model.db");
+    let mut app = create(dir.path());
+    app.login("lumen", PASS, None).unwrap();
+    let untouched = std::fs::read(&db).unwrap();
+    assert!(app.message("+ kein ziel vorhanden").is_err());
+    assert_eq!(std::fs::read(&db).unwrap(), untouched);
+    app.message("Ich heiße Jinx!").unwrap();
+    assert_eq!(
+        app.message("+ Mein Architekt heißt Lumen")
+            .unwrap()
+            .feedback,
+        Some(1)
+    );
+    assert_eq!(app.status().unwrap()["feedback_counts"]["positive"], 1);
+    drop(app);
+    let mut app = App::open(&db).unwrap();
+    app.login("lumen", PASS, None).unwrap();
+    assert_eq!(app.message("-").unwrap().feedback, Some(-1));
+    assert_eq!(app.status().unwrap()["feedback_counts"]["negative"], 1);
+    let count = app.status().unwrap()["neurons"].clone();
+    app.message("jinx?").unwrap();
+    assert_eq!(app.status().unwrap()["neurons"], count);
+    app.freeze().unwrap();
+    let before = std::fs::read(&db).unwrap();
+    assert!(app.message("+ falscher modus").is_err());
+    assert_eq!(before, std::fs::read(&db).unwrap());
+    app.logout();
+    assert!(app.message("- gesperrt").is_err());
 }

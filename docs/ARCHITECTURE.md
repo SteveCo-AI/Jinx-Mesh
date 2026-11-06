@@ -60,3 +60,18 @@ mechanics. The engine has no action executor and does not treat imported demo
 metadata as language output. Graph context can support associative recall, but
 it does not establish factual or general language understanding. Consolidation
 applies only to the active graph neighborhood and does not delete neuron IDs.
+
+## Structural observations and rated replies
+
+`language.rs` separates lexical tokens from positional structural marks and
+supplies a default final dot when omitted. The bounded structural side network
+learns punctuation and stopping from observed utterance positions. There are no
+hardcoded question/answer sentence classes. Context hashes include lexical input
+and structural marks. Signed DEV feedback updates context-specific start,
+transition and marker weights, while neutral messages only learn language.
+
+Feedback targets contain compact word sequences and structural marks, not
+plaintext transcript files. Normal turns persist their target with authenticated
+model metadata; continuation/read-only replies update the session target only.
+Imports never interpret signs as dialog feedback. Old lexical record identities
+remain stored; canonical matching reuses punctuation-bearing aliases lazily.

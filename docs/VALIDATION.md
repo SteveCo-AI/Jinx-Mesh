@@ -1,5 +1,32 @@
 # Validation 2026-11-06
 
+## Current structural-marker and feedback update
+
+Format and Clippy checks passed. The 46 regression checks cover 25 library,
+4 acceptance and 17 security/integration tests. Added checks demonstrate:
+
+- One lexical identity across punctuation variants; missing endings normalize
+  to a dot without changing raw archived input.
+- Observed punctuation and continuation/stopping patterns have no fixed
+  question/answer labels.
+- Negative feedback changes the selected continuation only in its rated input
+  context; positive feedback and punctuation weights are applied independently.
+- Neutral messages leave feedback counts unchanged. Signs never enter vocabulary.
+- Ratings survive reopening, including a sign-only rating. Frozen and locked
+  sessions cannot apply them, and rejected feedback leaves vault bytes unchanged.
+- Legacy punctuation-bearing records are reused after lazy loading without
+  deleting or replacing the old node identity.
+- Read-only evaluation does not train or write to the vault.
+
+The terminal smoke run passed with hidden credentials, learning, a positive
+feedback acknowledgement, status counters, freeze, logout and exit. The release
+binary was rebuilt and installed by atomic replacement.
+
+## Initial v2.5.0 validation and historical measurements
+
+The following records describe the initial build before these updates.
+
+
 ## Automated checks
 
 - `cargo fmt -- --check`: passed.

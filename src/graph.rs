@@ -1,35 +1,22 @@
 use crate::model::{Node, State};
 use std::collections::{BTreeMap, BTreeSet};
-use unicode_normalization::UnicodeNormalization;
 
 pub(crate) fn tokens(text: &str) -> Vec<String> {
-    let normalized = text.nfc().collect::<String>().to_lowercase();
-    let mut out = Vec::new();
-    let mut token = String::new();
-    for c in normalized.chars() {
-        if c.is_alphanumeric() || (c == '\'' && !token.is_empty()) {
-            token.push(c);
-        } else if matches!(c, '.' | ',' | '!' | '?' | ':' | ';' | '…') && !token.is_empty() {
-            // Keep punctuation attached to its word so lexical output retains
-            // observed sentence boundaries without adding synthetic vocabulary.
-            token.push(c);
-        } else if !token.is_empty() {
-            out.push(std::mem::take(&mut token));
-        }
-    }
-    if !token.is_empty() {
-        out.push(token);
-    }
-    out
+    crate::language::parse(text).words
 }
 pub(crate) fn word(state: &State, t: &str) -> Option<String> {
     let id = format!("lex:{t}");
+    if state.neuronen.get(&id).is_some_and(|n| n.typ == "LEX") {
+        return Some(id);
+    }
+    // Legacy punctuation-bearing nodes remain intact and can be reused lazily.
     state
         .neuronen
-        .get(&id)
-        .is_some_and(|n| n.typ == "LEX")
-        .then_some(id)
+        .iter()
+        .find(|(_, n)| n.typ == "LEX" && tokens(&n.label).as_slice() == [t])
+        .map(|(id, _)| id.clone())
 }
+
 pub(crate) fn edge(state: &State, a: &str, b: &str) -> Option<f64> {
     state.kanten.get(a)?.get(b).copied()
 }
@@ -119,7 +106,13 @@ pub(crate) struct Path {
     pub kern: Option<String>,
     pub weight: f64,
 }
-fn neighbors(state: &State, a: &str, prev: Option<&str>, used: &[String]) -> Vec<String> {
+fn neighbors(
+    state: &State,
+    a: &str,
+    prev: Option<&str>,
+    used: &[String],
+    context: Option<&str>,
+) -> Vec<String> {
     let mut ns: Vec<_> = state
         .kanten
         .get(a)
@@ -151,28 +144,50 @@ fn neighbors(state: &State, a: &str, prev: Option<&str>, used: &[String]) -> Vec
             .and_then(|m| m.get(&state.neuronen[*b_id].label))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        b_order
-            .cmp(&a_order)
+        let feedback = |id: &str| {
+            context
+                .map(|q| {
+                    crate::language::bias(
+                        state,
+                        q,
+                        tokens(&state.neuronen[a].label).first().map(String::as_str),
+                        tokens(&state.neuronen[id].label)
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or(id),
+                    )
+                })
+                .unwrap_or(0.0)
+        };
+        feedback(b_id)
+            .total_cmp(&feedback(a_id))
+            .then_with(|| b_order.cmp(&a_order))
             .then_with(|| y.total_cmp(x))
             .then(a_id.cmp(b_id))
     });
     ns.into_iter().map(|(id, _)| id.clone()).collect()
 }
-fn sentence_end(state: &State, id: &str) -> bool {
-    state.neuronen[id].label.ends_with(['.', '!', '?', '…'])
+fn sentence_end(state: &State, ids: &[String]) -> bool {
+    let words: Vec<_> = ids
+        .iter()
+        .filter_map(|id| tokens(&state.neuronen[id].label).into_iter().next())
+        .collect();
+    words.last().is_some_and(|w| {
+        crate::language::end(state, words.iter().rev().nth(1).map(String::as_str), w)
+    })
 }
-fn walk(state: &State, start: &str) -> Path {
+fn walk(state: &State, start: &str, context: Option<&str>) -> Path {
     let mut p = Path {
         nodes: vec![start.into()],
         ..Path::default()
     };
     while p.nodes.len() < (state.number("max_pfad_len") as usize) {
         let a = p.nodes.last().unwrap().clone();
-        if sentence_end(state, &a) {
+        if sentence_end(state, &p.nodes) {
             break;
         }
         let prev = p.nodes.iter().rev().nth(1).map(String::as_str);
-        let ns = neighbors(state, &a, prev, &p.nodes);
+        let ns = neighbors(state, &a, prev, &p.nodes, context);
         if ns.is_empty() {
             break;
         }
@@ -181,10 +196,10 @@ fn walk(state: &State, start: &str) -> Path {
             alt.push(ns[1].clone());
             while alt.len() < (state.number("max_pfad_len") as usize)
                 && state.neuronen[alt.last().unwrap()].typ != "KERN"
-                && !sentence_end(state, alt.last().unwrap())
+                && !sentence_end(state, &alt)
             {
                 let prev = alt.iter().rev().nth(1).map(String::as_str);
-                let next = neighbors(state, alt.last().unwrap(), prev, &alt);
+                let next = neighbors(state, alt.last().unwrap(), prev, &alt, context);
                 if next.is_empty() {
                     break;
                 }
@@ -210,10 +225,29 @@ fn walk(state: &State, start: &str) -> Path {
     }
     p
 }
+#[cfg(test)]
 pub(crate) fn path(state: &State, starts: &[String]) -> Option<Path> {
+    path_with_context(state, starts, None)
+}
+pub(crate) fn path_with_context(
+    state: &State,
+    starts: &[String],
+    context: Option<&str>,
+) -> Option<Path> {
     let mut best: Option<Path> = None;
     for s in starts {
-        let p = walk(state, s);
+        let mut p = walk(state, s, context);
+        if let Some(context) = context {
+            let mut prev: Option<String> = None;
+            for id in &p.nodes {
+                let word = tokens(&state.neuronen[id].label)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                p.weight += 10.0 * crate::language::bias(state, context, prev.as_deref(), &word);
+                prev = Some(word);
+            }
+        }
         if best
             .as_ref()
             .is_none_or(|b| (p.kern.is_some(), p.weight) > (b.kern.is_some(), b.weight))

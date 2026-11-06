@@ -110,6 +110,26 @@ impl State {
                 }
             }
         }
+        for name in [
+            "structure_observations",
+            "context_feedback",
+            "feedback_counts",
+        ] {
+            if let Some(value) = self.extra.get(name) {
+                if !value.is_object() {
+                    bail!("Ungültige Sprachmetadaten: {name}");
+                }
+            }
+        }
+        if let Some(target) = self.extra.get("feedback_target") {
+            if target["context"].as_str().is_none()
+                || target["words"]
+                    .as_array()
+                    .is_none_or(|a| a.len() > 128 || a.iter().any(|v| !v.is_string()))
+            {
+                bail!("Ungültiges Bewertungsziel");
+            }
+        }
         for key in [
             "auto_slaap_ab",
             "daempf_faktor",
@@ -141,6 +161,8 @@ impl State {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Reply {
+    #[serde(default)]
+    pub feedback: Option<i8>,
     pub text: String,
     pub art: String,
     pub aktion: Option<String>,

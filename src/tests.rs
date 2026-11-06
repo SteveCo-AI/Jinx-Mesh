@@ -35,7 +35,7 @@ fn new_model_is_linguistically_empty() {
 fn first_message_is_imitation_and_only_heard_words_become_nodes() {
     let mut e = engine();
     let r = e.train("Hallo ich bin Lumen").unwrap();
-    assert_eq!(r.text, "hallo ich bin lumen");
+    assert_eq!(r.text, "hallo ich bin lumen.");
     assert_eq!(e.state.neuronen.len(), 4);
     assert_eq!(r.aktion, None);
     for n in e.state.neuronen.values() {
@@ -88,7 +88,8 @@ fn context_counts_change_the_generated_path_and_punctuation_is_retained() {
     let mut fresh = engine();
     let first = fresh.train("Hallo, Welt!").unwrap();
     assert_eq!(first.text, "hallo, welt!");
-    assert!(graph::word(&fresh.state, "hallo,").is_some());
+    assert!(graph::word(&fresh.state, "hallo").is_some());
+    assert!(!fresh.state.neuronen.contains_key("lex:hallo,"));
 }
 
 #[test]
@@ -145,10 +146,10 @@ fn even_imported_demo_edges_cannot_trigger_actions_or_expose_internal_labels() {
         json!({"aktionen":{"attention":{"ergebnis":[{"text":"projekt alpha"}]}}}),
     )
     .unwrap();
-    for r in [e.infer("wichtig").unwrap(), e.train("wichtig").unwrap()] {
-        assert_eq!(r.text, "wichtig");
-        assert_eq!(r.aktion, None);
-    }
+    assert_eq!(e.infer("wichtig").unwrap().text, "wichtig");
+    let r = e.train("wichtig").unwrap();
+    assert_eq!(r.text, "wichtig.");
+    assert_eq!(r.aktion, None);
     assert_eq!(e.state.neuronen.len(), 3); // Preserve imported data, never delete identities.
 }
 #[test]
@@ -218,8 +219,121 @@ fn long_learned_sentence_is_not_cut_after_twelve_words() {
 }
 
 #[test]
-fn learned_output_stops_at_observed_sentence_boundary() {
+fn observed_internal_markers_do_not_impose_a_hardcoded_stop() {
     let mut e = engine();
     e.train("eins zwei. drei vier.").unwrap();
-    assert_eq!(e.infer("eins").unwrap().text, "eins zwei.");
+    assert_eq!(e.infer("eins").unwrap().text, "eins zwei. drei vier.");
+}
+
+#[test]
+fn punctuation_is_separate_and_missing_end_is_a_default_dot() {
+    let mut e = engine();
+    e.train("Jinx").unwrap();
+    e.train("Jinx!").unwrap();
+    e.train("Jinx?").unwrap();
+    assert_eq!(e.state.neuronen.len(), 1);
+    assert_eq!(
+        crate::language::render(
+            &crate::language::parse("Hallo").words,
+            &crate::language::parse("Hallo").marks
+        ),
+        "hallo."
+    );
+    for symbol in [".", "!", "?", ":", ";"] {
+        let p = crate::language::parse(&format!("Jinx{symbol}"));
+        assert_eq!(p.words, ["jinx"]);
+        assert_eq!(p.marks.last().unwrap().symbol, symbol);
+    }
+}
+
+#[test]
+fn feedback_changes_only_the_rated_context_and_never_becomes_vocabulary() {
+    let mut e = engine();
+    e.train("start red end.").unwrap();
+    e.train("start blue end.").unwrap();
+    let original = e.train("start?").unwrap().text;
+    assert!(original.contains("blue"));
+    let reply = e.train("- andere wörter.").unwrap();
+    assert_eq!(reply.feedback, Some(-1));
+    assert!(e.infer("start?").unwrap().text.contains("red"));
+    assert!(e.infer("start!").unwrap().text.contains("blue"));
+    let rated = e.infer("start?").unwrap().text;
+    crate::language::remember(&mut e.state, "start?", &rated);
+    e.train("+ weitere wörter.").unwrap();
+    assert!(e.infer("start?").unwrap().text.contains("red"));
+    let counts = e.state.extra["feedback_counts"].clone();
+    e.train("neutraler neuer satz.").unwrap();
+    assert_eq!(e.state.extra["feedback_counts"], counts);
+    assert!(!e.state.neuronen.contains_key("lex:+"));
+    assert!(!e.state.neuronen.contains_key("lex:-"));
+}
+
+#[test]
+fn feedback_also_weights_observed_markers_without_question_rules() {
+    let mut e = engine();
+    e.train("hallo!").unwrap();
+    e.train("hallo?").unwrap();
+    crate::language::remember(&mut e.state, "gruß", "hallo?");
+    e.train("- neuer satz.").unwrap();
+    let ids = vec!["lex:hallo".into()];
+    assert_eq!(
+        crate::language::render_path(&e.state, &ids, &crate::language::context("gruß")),
+        "hallo!"
+    );
+    crate::language::remember(&mut e.state, "gruß", "hallo!");
+    e.train("+ anderer satz.").unwrap();
+    assert_eq!(
+        crate::language::render_path(&e.state, &ids, &crate::language::context("gruß")),
+        "hallo!"
+    );
+}
+
+#[test]
+fn old_punctuation_node_is_reused_after_lazy_loading_without_deletion() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = State::empty();
+    state.neuronen.insert(
+        "lex:jinx!".into(),
+        Node {
+            id: "lex:jinx!".into(),
+            typ: "LEX".into(),
+            label: "jinx!".into(),
+            staerke: 0.2,
+            alter: "jung".into(),
+            nutzt: 0,
+            geboren: 0,
+            ring: None,
+            extra: BTreeMap::new(),
+        },
+    );
+    let state_path = dir.path().join("state.json");
+    let actions_path = dir.path().join("actions.json");
+    std::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    std::fs::write(&actions_path, b"{\"aktionen\":{}}").unwrap();
+    let db = dir.path().join("model.db");
+    let pass = "Legacy compatibility passphrase!";
+    let mut app = crate::App::create(
+        &db,
+        "review",
+        pass,
+        None,
+        None,
+        crate::Import {
+            state: state_path,
+            actions: actions_path,
+            legacy_audit: None,
+        },
+    )
+    .unwrap();
+    app.login("review", pass, None).unwrap();
+    let reply = app.message("Jinx?").unwrap();
+    assert_eq!(reply.neue_neuronen, 0);
+    assert_eq!(reply.text, "jinx?");
+    assert_eq!(app.verify_graph_full().unwrap(), 1);
+    assert_eq!(app.graph_view()["nodes"][0]["id"], "lex:jinx!");
+    drop(app);
+    let mut app = crate::App::open(&db).unwrap();
+    app.login("review", pass, None).unwrap();
+    app.freeze().unwrap();
+    assert_eq!(app.message("Jinx").unwrap().text, "jinx?");
 }

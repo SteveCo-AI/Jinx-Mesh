@@ -5,6 +5,7 @@ mod crypto;
 mod engine;
 mod graph;
 mod healing;
+mod language;
 mod model;
 mod retrieval;
 mod store;

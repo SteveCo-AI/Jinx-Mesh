@@ -72,6 +72,15 @@ impl Drop for CredentialWait {
     }
 }
 fn show_reply(reply: saeugling::Reply) {
+    if let Some(value) = reply.feedback {
+        println!(
+            "[Systemhinweis: {} Bewertung gespeichert.]",
+            if value > 0 { "Positive" } else { "Negative" }
+        );
+        if reply.text.is_empty() {
+            return;
+        }
+    }
     if reply.text.is_empty() {
         println!("[Systemhinweis: Aus dem geladenen Netz konnte keine Antwort gebildet werden.]");
     } else {

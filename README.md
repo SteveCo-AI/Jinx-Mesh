@@ -51,8 +51,9 @@ second copy of the message.
 Messages are limited to 128 tokenizer tokens and 16 KiB of UTF-8 text; file imports are
 limited to 128 tokens and 256 KiB. These bounds keep the working set manageable.
 Up to 128 new word nodes can be learned per message, within the resident graph
-budget. Generated graph paths stop at observed sentence punctuation (`. ! ? …`),
-a missing continuation, or a safety cap of 128 word nodes. Existing vaults using
+budget. Generated graph paths stop at learned ending patterns, a missing
+continuation, or a safety cap of 128 word nodes. Sentence-type meanings are not
+assigned to punctuation. Existing vaults using
 the original twelve-word defaults automatically receive the increased budgets
 when loaded by the engine; their learned graph is preserved.
 If a graph traversal reaches its per-call budget, the reply is marked as
@@ -143,3 +144,42 @@ Frozen inference reloads bounded graph neighborhoods on demand without updating
 the vault, training counters, archive, or checkpoints. Its decryption key remains
 in session memory for reading and is cleared on logout or session expiry.
 Write restrictions are enforced by the application, not by a separate cryptographic key.
+
+## Structural markers and DEV feedback
+
+Words and punctuation observations are stored separately. `Jinx`, `Jinx!`, and
+`Jinx?` share one lexical identity in new training. The symbols `. ! ? : ;`
+(and internal commas and ellipses) are structural observations. Missing terminal
+punctuation is normalized to `.` for learning; raw input remains exact in the
+encrypted archive. No marker is pre-labelled as a question, command, or answer.
+End/continuation counts are learned from observed utterances, so punctuation
+inside a multi-sentence message does not impose a fixed output stop.
+
+In an authenticated DEV session, prefix the next message with `+` or `-` to rate
+the immediately preceding model reply. Its context includes the input words and
+structural markers. The following text is ordinary new training material:
+
+```text
++ Mein Architekt heißt Lumen.
+- Ich heiße Jinx. Mein Architekt heißt Lumen.
+```
+
+A prefix alone applies a rating without introducing words. Without a prefix,
+there is no rating; normal language learning continues. Feedback is a separate
+control signal and never enters vocabulary. A system acknowledgement confirms
+successful application. Frozen and locked sessions cannot apply feedback.
+`/status` includes feedback counts.
+
+Feedback adjusts bounded context-specific scores for start words, transitions,
+and observed punctuation. It does not weaken every use of the same words.
+Scores are clamped to [-2, 2] in steps of 0.25; feedback cannot delete neurons.
+Structural observations are bounded to 4096 contexts; feedback to 256 input
+contexts with up to 256 transition/marker entries each. These are learned side
+networks stored as encrypted graph metadata. This is experimental reinforcement,
+not a guarantee of question understanding or semantic generalization.
+
+Older punctuation-bearing node records are retained and reused lazily through
+bounded alias lookups. This does not perform a full global neuron consolidation.
+A previous reply target survives reopening after a normal training turn. Explicit
+continuations and read-only inference update the in-memory target; background
+prefetch never rates or replaces the last visible reply.
