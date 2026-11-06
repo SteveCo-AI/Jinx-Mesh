@@ -6,3 +6,5 @@
 *.lock
 !Cargo.lock
 /private/
+# Interner Forschungsplan (kein Release-Inhalt, Raphael 06.11.2026)
+/FORSCHUNG-RW-1.md
