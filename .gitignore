@@ -6,5 +6,11 @@
 *.lock
 !Cargo.lock
 /private/
-# Interner Forschungsplan (kein Release-Inhalt, Raphael 06.11.2026)
+# Interna (Raphael 06.11.2026): Arbeits-/Info-Dateien bleiben im lokalen Ordner,
+# sie gehören nicht in das öffentliche Release-Repo.
 /FORSCHUNG-RW-1.md
+/FIXPLAN-*.md
+/phase2-spec.md
+/docs/FEATURE-*.md
+/docs/ROADMAP-*.md
+/docs/validation/*.log
