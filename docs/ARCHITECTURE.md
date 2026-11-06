@@ -1,4 +1,4 @@
-# Jinx 2.5.0 architecture
+# Jinx-Mesh 2.6.1 architecture
 
 `App` is the local authorization and integration boundary. A locked session has
 no active key or graph. A frozen session moves its key to read-only session access and cannot train;
@@ -11,10 +11,15 @@ the CLI's idle worker also stops when frozen, logged out, or expired.
 | `engine.rs` | Graph-only imitation and generation over a bounded active slice |
 | `healing.rs` | Non-destructive duplicate aliases, edge consolidation, quarantine report |
 | `retrieval.rs` | Ordered lexical, temporal, and learned-context archive handlers |
-| `app.rs` | Authentication boundary, graph activation, recall, checkpoint and session coordination |
-| `store.rs` | Format-2 compatibility and format-3 encrypted paging, manifests, receipts, and archive |
+| `language.rs` | Lexical/structural parsing, context hashing, bounded observation and rating maps |
+| `journal.rs` | Encrypted op journal: append, undo (steps/round), crash recovery fails closed |
+| `gate.rs` | Integration gate: rules as data, rejects recorded as `integration_reject` |
+| `mutation.rs` | Phase-2.5 novelty operator (off by default), folding detection, `/falsch` + `/echtes_wort` healing |
+| `app.rs` | Authentication boundary, graph activation, recall, checkpoint, and session coordination (largest coordinator; planned de-splintering, see WARTUNG.md) |
+| `store.rs` | Format-2 compatibility and format-3 encrypted paging, manifests, receipts, and archive (planned de-splintering, see WARTUNG.md) |
 | `crypto.rs` | Password key derivation, bounded compression, AEAD and key handling |
 | `main.rs` | CLI, hidden credentials, truthful progress, and idle prefetch scheduling |
+| `tests.rs` | Library test suite (planned split by module, see WARTUNG.md) |
 
 ## Format 3 and lazy graph activation
 
@@ -61,6 +66,16 @@ metadata as language output. Graph context can support associative recall, but
 it does not establish factual or general language understanding. Consolidation
 applies only to the active graph neighborhood and does not delete neuron IDs.
 
+## Module journal, gate, and mutation operator (2.6.x)
+
+`journal.rs` persists every learning operation as an authenticated row
+before it takes effect; `/undo` rolls back one or more steps or a whole round
+and crash recovery discards a session rather than keeping a half-written
+vault (fails closed). `gate.rs` encodes integration rules as data and records
+rejected inserts. `mutation.rs` contains the optional novelty operator
+(configuration-gated, default off) plus folding detection and the
+`/falsch` / `/echtes_wort` healing commands — all journal-backed.
+
 ## Structural observations and rated replies
 
 `language.rs` separates lexical tokens from positional structural marks and
@@ -75,3 +90,19 @@ plaintext transcript files. Normal turns persist their target with authenticated
 model metadata; continuation/read-only replies update the session target only.
 Imports never interpret signs as dialog feedback. Old lexical record identities
 remain stored; canonical matching reuses punctuation-bearing aliases lazily.
+
+## Maintenance backlog (2.6.2 wave)
+
+The module structure is sound; no rebuild is needed. Scheduled stepwise work
+for the next maintenance wave (not part of a feature release):
+
+1. Split `app.rs` (~2,067 lines): auth, chat/training, undo/heal, import, recall
+   coordination each get a clear owner.
+2. Split `store.rs` (~1,250 lines): DB access, encryption, graph paging, and
+   archive each get a clear owner.
+3. Reorganize `tests.rs` (~3,047 lines) by module.
+4. Keep this document aligned with the version header each release.
+
+Order rule holds: measurement waves (RW-1) take precedence over structural
+refactoring — the experiment measures the shipped 2.6.1 mechanics, so the
+measured code must not move underneath a running wave.
