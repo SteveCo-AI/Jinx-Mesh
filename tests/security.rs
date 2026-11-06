@@ -338,3 +338,29 @@ fn default_creation_is_empty_and_authentication_does_not_seed_it() {
     app.login("lumen", PASS, None).unwrap();
     assert_eq!(app.status().unwrap()["neurons"], 6);
 }
+
+#[test]
+fn frozen_inference_reloads_cold_graph_without_learning_or_disk_writes() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("model.db");
+    let mut app = create(dir.path());
+    app.login("lumen", PASS, None).unwrap();
+    app.message("kaltwort verbindet erinnerung.").unwrap();
+    app.message("anderesthema bleibt separat.").unwrap();
+    drop(app);
+    let mut app = App::open(&db).unwrap();
+    app.login("lumen", PASS, None).unwrap();
+    app.freeze().unwrap();
+    app.freeze().unwrap(); // Repeated freeze must preserve read capability.
+    let before = std::fs::read(&db).unwrap();
+    let interactions = app.status().unwrap()["interactions"].clone();
+    let reply = app.message("kaltwort").unwrap();
+    assert_eq!(reply.text, "kaltwort verbindet erinnerung.");
+    assert!(!reply.gelernt);
+    assert_eq!(reply.neue_neuronen, 0);
+    assert!(reply.activation.unwrap().nodes_loaded > 0);
+    assert_eq!(app.status().unwrap()["interactions"], interactions);
+    assert_eq!(std::fs::read(&db).unwrap(), before);
+    app.logout();
+    assert!(app.message("kaltwort").is_err());
+}

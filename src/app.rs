@@ -38,6 +38,7 @@ struct Session {
     graph_cache: GraphSlice,
     prefetch_status: Option<ActivationStatus>,
     key: Option<Key>,
+    read_key: Option<Key>,
     payload: Payload,
     started: Instant,
     last: Instant,
@@ -206,6 +207,7 @@ impl App {
             graph_cache,
             prefetch_status: None,
             key: Some(key),
+            read_key: None,
             payload,
             started: Instant::now(),
             last: Instant::now(),
@@ -222,8 +224,10 @@ impl App {
             .session
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Anmeldung erforderlich"))?;
+        if !s.frozen {
+            s.read_key = s.key.take();
+        }
         s.frozen = true;
-        s.key = None;
         if let Some(secret) = &mut s.payload.totp {
             secret.zeroize();
         }
@@ -248,7 +252,27 @@ impl App {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Gesperrt: zuerst /login"))?;
         if s.frozen {
-            let r = s.engine.infer(text)?;
+            let key = s.read_key.as_ref().expect("frozen read key");
+            let (records, mut activation, _, _, _) = activate_graph(
+                &self.store,
+                key,
+                &s.payload.state,
+                text,
+                None,
+                None,
+                &mut progress,
+                4,
+            )?;
+            // Read-only inference uses no persisted checkpoint, audit, or archive writes.
+            activation.can_continue = false;
+            s.graph_cache = records;
+            s.engine = Engine::new(
+                Engine::active_state(&s.payload.state, &s.graph_cache),
+                s.payload.actions.clone(),
+            )?;
+            let mut r = s.engine.infer(text)?;
+            s.prefetch_status = Some(activation.clone());
+            r.activation = Some(activation);
             s.last = Instant::now();
             return Ok(r);
         }

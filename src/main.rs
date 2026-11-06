@@ -72,7 +72,11 @@ impl Drop for CredentialWait {
     }
 }
 fn show_reply(reply: saeugling::Reply) {
-    println!("{}", reply.text);
+    if reply.text.is_empty() {
+        println!("[Systemhinweis: Aus dem geladenen Netz konnte keine Antwort gebildet werden.]");
+    } else {
+        println!("{}", reply.text);
+    }
 }
 fn main() {
     if let Err(e) = run() {

@@ -1,7 +1,7 @@
 # Jinx 2.5.0 architecture
 
 `App` is the local authorization and integration boundary. A locked session has
-no active key or graph. A frozen session drops the write key and cannot train;
+no active key or graph. A frozen session moves its key to read-only session access and cannot train;
 the CLI's idle worker also stops when frozen, logged out, or expired.
 
 | Module | Responsibility |

@@ -13,7 +13,7 @@
 - Fehlversuche erzeugen persistierte exponentielle Pausen von zwei bis 60 Sekunden.
   Ein fehlgeschlagener erneuter Login beendet eine bisher aktive Sitzung.
 - 30 Minuten Inaktivität, acht Stunden maximale Sitzung, explizites Logout.
-- `/freeze` verwirft den Schlüssel. Zur Rückkehr zu Lernen braucht es neue Anmeldung.
+- `/freeze` sperrt Schreibzugriffe und behält den Entschlüsselungsschlüssel für begrenztes Nachladen bei Inferenz im RAM. Die Lesebeschränkung wird durch die Anwendung durchgesetzt; es handelt sich nicht um einen kryptografisch getrennten Schlüssel. Zur Rückkehr zu Lernen braucht es neue Anmeldung.
 - Anmeldedaten werden nicht der Engine übergeben, nicht in Deltas protokolliert
   und in der CLI nicht angezeigt. Rust-Schlüssel und Passwortpuffer werden mit
   zeroize verwaltet. Das Modell selbst wird beim Abmelden freigegeben, jedoch
@@ -31,8 +31,8 @@
   `/verify-graph` und `/verify-archive` scannen jeweils den gesamten Bestand
   streaming und mit begrenztem RAM; ihre I/O-Kosten wachsen mit der Datenmenge.
 - Die Hintergrund-Vorladung lädt nur eine begrenzte Graphseite je Schritt und
-  läuft nur mit aktiver Developer-Sitzung. `/freeze`, Logout und Sitzungsablauf
-  verwerfen den Zugriffsschlüssel; Vorladung wird während verdeckter
+  läuft nur mit aktiver Developer-Sitzung. `/freeze` stoppt die Hintergrundvorladung, erlaubt aber lesendes Nachladen bei Nachrichten. Logout und Sitzungsablauf
+  verwerfen sämtliche Sitzungsschlüssel; Vorladung wird während verdeckter
   Passwort-/Authenticator-Eingaben pausiert.
 
 ## Präzise Grenzen

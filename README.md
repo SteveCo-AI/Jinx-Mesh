@@ -65,7 +65,7 @@ discarded when the model revision changes.
 | Command | Function |
 |---|---|
 | `/login` | Open a Developer learning session |
-| `/freeze` | Stop learning and discard the write key |
+| `/freeze` | Stop learning; reload graph records for read-only inference |
 | `/logout` | Lock the vault and release the loaded state |
 | `/status` | Show global graph size, active working set, retrieval handlers, and prefetch state |
 | `/recall TEXT` | Search encrypted episodes using lexical and learned-context ranking |
@@ -138,3 +138,8 @@ This window needs Python 3 and PySide6; the learning engine remains CPU-only.
 Snapshots travel through a private process pipe and are not saved to disk.
 Logout and session expiry clear the display; closing the window leaves chat usable.
 The view shows the resident graph, not the full network or a literal thought trace.
+
+Frozen inference reloads bounded graph neighborhoods on demand without updating
+the vault, training counters, archive, or checkpoints. Its decryption key remains
+in session memory for reading and is cleared on logout or session expiry.
+Write restrictions are enforced by the application, not by a separate cryptographic key.
