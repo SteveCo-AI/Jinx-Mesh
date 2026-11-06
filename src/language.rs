@@ -1,7 +1,9 @@
 //! Structural observations and context-scoped user feedback; no sentence-type labels.
-//! Kap. 18 adds the two konfig-data anchor roots and the implicit feedback
-//! channels: no ritual word is hardcoded, and the anchor weight matures as
-//! the implicit signals prove reliable.
+//! Kap. 18's implicit channel is structure recognition only — comparing two
+//! token sequences: repeating the previous question word for word is one
+//! negative rating step. There is no ritual word and no continuation
+//! confirmation; without a +/- prefix an ordinary message never rates
+//! anything.
 use crate::{graph, model::State};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -197,7 +199,7 @@ fn marker_bias(state: &State, query: &str, prev: Option<&str>, word: &str, symbo
 const BEWERTUNG_SCHRITT: f64 = 0.25;
 
 /// Rate the stored target's learned edges and marks by `delta` inside its
-/// context. Shared mechanics of the explicit +/-, anchor, and implicit
+/// context. Shared mechanics of the explicit +/- and implicit repetition
 /// channels; it never consumes the stored target.
 fn ziel_bewerten(state: &mut State, ziel: &Value, delta: f64) -> anyhow::Result<()> {
     let words = ziel["words"]
@@ -265,103 +267,55 @@ pub(crate) fn bias(state: &State, query: &str, prev: Option<&str>, word: &str) -
         .unwrap_or(0.0)
 }
 
-// ---- Kap. 18: Anker-Wörter und implizite Feedback-Kanäle ----
-// There is no ritual word: the two anchor roots live as konfig data
-// (`anker_plus`/`anker_minus`), fire as ordinary standalone input tokens,
-// and their words stay regular learned LEX nodes with no special status.
-// The implicit channel 1 is structure recognition only — comparing two
-// token sequences — never a word list.
+// ---- Kap. 18: Impliziter Wiederholungs-Kanal ----
+// There is no ritual word: rating happens only through the explicit +/-
+// prefix (a DEV tool; a sign at the message start hardly ever occurs by
+// chance) or through structure recognition — comparing two token sequences,
+// never a word list. The former konfig-data anchor words are gone together
+// with their weight and maturation: anchor words can occur by chance in any
+// sentence and falsify the weights (owner decision V01).
 
-/// One training move's Kap.-18 rating signals for the previous response:
-/// the configured anchor word that fired as a standalone token, and the
-/// implicit channel-1 signal (exact repetition of the previous question →
-/// one negative rating step; any continuation → +`implizit_positiv`).
+/// One training move's Kap.-18 implicit signal for the previous response:
+/// whether the input repeats the previous question word for word — the
+/// answer did not carry.
 pub(crate) struct Signale {
-    pub anker: Option<(String, i8)>,
-    pub implizit: Option<f64>,
+    pub wiederholung: bool,
 }
 
-/// Configured anchor root for a direction (+1/-1), normalized like an
-/// input token. None when the konfig key is absent.
-fn anker_wort(state: &State, richtung: i8) -> Option<String> {
-    let key = if richtung > 0 {
-        "anker_plus"
-    } else {
-        "anker_minus"
-    };
-    state
-        .konfig
-        .get(key)
-        .and_then(Value::as_str)
-        .and_then(|wort| parse(wort).words.into_iter().next())
-}
-
-/// Effective anchor weight: the learned value in `state.extra` once the
-/// maturation mechanism lowered it, otherwise the configured start value.
-fn anker_gewicht(state: &State) -> f64 {
-    state
-        .extra
-        .get("anker_gewicht")
-        .and_then(Value::as_f64)
-        .unwrap_or_else(|| state.number("anker_gewicht"))
-}
-
-/// Read one move's Kap.-18 signals before learning mutates anything.
+/// Read one move's Kap.-18 signal before learning mutates anything.
 /// `ziel` is the stored feedback target; the caller clones it because the
 /// explicit +/- rating consumes the stored copy.
 pub(crate) fn signale_lesen(
-    state: &State,
     tokens: &[String],
     explizit: Option<i8>,
     ziel: Option<&Value>,
 ) -> Signale {
-    // The first configured anchor word appearing as its own token fires;
-    // a longer compound never matches (token equality, no substrings).
-    let anker = tokens.iter().find_map(|token| {
-        [1i8, -1].into_iter().find_map(|richtung| {
-            anker_wort(state, richtung)
-                .filter(|wort| wort == token)
-                .map(|wort| (wort, richtung))
-        })
-    });
     // Kanal 1 (Ausführungskompetenz): repeating the previous question word
     // for word means the answer did not carry — one negative rating step.
-    // Moving on to something new is a light confirmation instead. An
-    // explicit +/- rating is the definitive signal of its move and
-    // replaces the implicit one; silence stays neutral; without the stored
-    // previous input there is no honest comparison.
-    let implizit = if explizit.is_some() || tokens.is_empty() {
-        None
-    } else {
-        match ziel
+    // Moving on to something new is NOT a signal (the implicit continuation
+    // confirmation is gone); an explicit +/- rating is the definitive signal
+    // of its move; without the stored previous input there is no honest
+    // comparison.
+    let wiederholung = explizit.is_none()
+        && !tokens.is_empty()
+        && ziel
             .and_then(|ziel| ziel.get("eingabe"))
             .and_then(Value::as_array)
-        {
-            Some(eingabe) => {
-                let wiederholung = eingabe.len() == tokens.len()
+            .is_some_and(|eingabe| {
+                eingabe.len() == tokens.len()
                     && eingabe
                         .iter()
                         .zip(tokens)
-                        .all(|(alt, token)| alt.as_str() == Some(token.as_str()));
-                Some(if wiederholung {
-                    -BEWERTUNG_SCHRITT
-                } else {
-                    state.number("implizit_positiv")
-                })
-            }
-            None => None,
-        }
-    };
-    Signale { anker, implizit }
+                        .all(|(alt, token)| alt.as_str() == Some(token.as_str()))
+            });
+    Signale { wiederholung }
 }
 
-/// Apply one move's Kap.-18 signals: rate the previous response through the
-/// anchor word and the implicit channel, keep the maturing counters, and
-/// step the anchor weight down when the implicit channel proves reliable.
-/// `ziel` is the move's feedback target, passed separately because an
-/// explicit +/- rating already consumed the stored copy. Without a stored
-/// previous response nothing is rated — the anchor word still learns as an
-/// ordinary token through grow/hear.
+/// Apply one move's Kap.-18 signal: a repeated question rates the previous
+/// response one negative rating step. `ziel` is the move's feedback target,
+/// passed separately because an explicit +/- rating already consumed the
+/// stored copy. Without a stored previous response nothing is rated — the
+/// repeated word still learns as an ordinary token through grow/hear.
 pub(crate) fn signale_anwenden(
     state: &mut State,
     signale: &Signale,
@@ -373,113 +327,30 @@ pub(crate) fn signale_anwenden(
         .extra
         .entry("kanal2_letzte".into())
         .or_insert_with(|| json!({}));
-    if let Some((wort, zeichen)) = &signale.anker {
-        // Every anchor use records the maturing counters with it (Kap. 18).
-        let eintrag = reifung_eintrag(state, wort);
-        eintrag["nutzungen"] = json!(eintrag["nutzungen"].as_u64().unwrap_or(0).saturating_add(1));
+    if signale.wiederholung {
         if let Some(ziel) = ziel {
-            // The anchor weight applies zusätzlich zum impliziten Anteil.
-            ziel_bewerten(state, ziel, f64::from(*zeichen) * anker_gewicht(state))?;
+            ziel_bewerten(state, ziel, -BEWERTUNG_SCHRITT)?;
         }
     }
-    if let Some(delta) = signale.implizit {
-        if let Some(ziel) = ziel {
-            ziel_bewerten(state, ziel, delta)?;
-        }
-        // The maturing window counts implicit signals that came WITHOUT an
-        // anchor word; anchor moves link into the anchor instead.
-        if signale.anker.is_none() {
-            let feld = if delta > 0.0 { "positiv" } else { "negativ" };
-            let fenster_kap = state.number("anker_reif_fenster").clamp(1.0, f64::MAX) as usize;
-            for richtung in [1i8, -1] {
-                if let Some(wort) = anker_wort(state, richtung) {
-                    let eintrag = reifung_eintrag(state, &wort);
-                    eintrag[feld] = json!(eintrag[feld].as_u64().unwrap_or(0).saturating_add(1));
-                    if let Some(fenster) = eintrag["fenster"].as_array_mut() {
-                        fenster.push(json!(feld));
-                        while fenster.len() > fenster_kap {
-                            fenster.remove(0);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    reifung_pruefen(state);
     Ok(())
 }
 
-/// Maturing counters of one anchor word: the cumulative implicit signal
-/// counts `(a)` positiv / `(b)` negativ that came without an anchor, the
-/// rolling window of the last relevant cases, and the recorded uses.
-fn reifung_eintrag<'a>(state: &'a mut State, wort: &str) -> &'a mut Value {
-    state
-        .extra
-        .entry("anker_maturing".into())
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .expect("anker_maturing bleibt ein Objekt")
-        .entry(wort.to_owned())
-        .or_insert_with(|| json!({"positiv":0,"negativ":0,"nutzungen":0,"fenster":[]}))
-}
-
-/// Kap.-18 maturation: once the last `anker_reif_fenster` relevant implicit
-/// cases match an anchor's signal in at least `anker_reif_ueber_einstimmig`
-/// of cases, the anchor weight steps down by `anker_reif_schritt` toward
-/// `anker_gewicht_min`. The lowered weight is learned data in
-/// `state.extra` (`anker_gewicht`), so the op-journal records and rolls
-/// back the change exactly; the konfig key stays the editable start value.
-fn reifung_pruefen(state: &mut State) {
-    let fenster_min = state.number("anker_reif_fenster").clamp(1.0, f64::MAX) as usize;
-    let ueber_einstimmig = state.number("anker_reif_ueber_einstimmig");
-    let schritt = state.number("anker_reif_schritt");
-    let minimum = state.number("anker_gewicht_min");
-    for richtung in [1i8, -1] {
-        let Some(wort) = anker_wort(state, richtung) else {
-            continue;
-        };
-        let reif = state
-            .extra
-            .get("anker_maturing")
-            .and_then(|m| m.get(&wort))
-            .and_then(|e| e.get("fenster"))
-            .and_then(Value::as_array)
-            .is_some_and(|fenster| {
-                if fenster.len() < fenster_min {
-                    return false;
-                }
-                let signal = if richtung > 0 { "positiv" } else { "negativ" };
-                let treffer = fenster
-                    .iter()
-                    .filter(|v| v.as_str() == Some(signal))
-                    .count();
-                treffer as f64 / fenster.len() as f64 >= ueber_einstimmig
-            });
-        if reif {
-            let aktuell = anker_gewicht(state);
-            if aktuell > minimum {
-                state.extra.insert(
-                    "anker_gewicht".into(),
-                    json!((aktuell - schritt).max(minimum)),
-                );
-            }
-        }
-    }
-}
-
 // ---- Kap. 19: Unsicherheits-Fallback ----
-// The unclear signal is purely mechanical: a training move that brought no
-// anchor word and no explicit +/- rating while its conversation carries
-// contradictory context-feedback values in the move's context — the strongest
-// positive AND the strongest negative both reach `fallback_unklar_min` (the
-// rating channels clamp scores into [-2, 2], which is the band's upper end).
+// The unclear signal is purely mechanical: a training move without an
+// explicit +/- rating while its conversation carries contradictory
+// context-feedback values in the move's context — the strongest positive
+// AND the strongest negative both reach `fallback_unklar_min` (the rating
+// channels clamp scores into [-2, 2], which is the band's upper end).
 // Instead of leaving another bare guess-answer, the move appends ONE
 // utterance whose building blocks come from konfig data — rotating scaffold
 // variants plus one learned conversation word — and a theme asked too often
-// gets the status announcement instead of a further question. The utterance
-// never becomes the rateable feedback target: no rating, repetition
-// comparison, or anchor maturation may consume it (Kap. 18/19); the user's
-// answer to it is a normal learning move, recorded into the channel-2 slot.
+// gets the status announcement instead of a further question. The flow
+// ships disarmed: the konfig switch `fallback_aktivier` (the
+// mutation_aktivier pattern) gates the whole path; without the vault's GO
+// in the data no prefabricated text is ever appended. The utterance never
+// becomes the rateable feedback target: no rating or repetition comparison
+// may consume it (Kap. 18/19); the user's answer to it is a normal learning
+// move, recorded into the channel-2 slot.
 
 /// Context-feedback values one training move carries between its input tokens
 /// and its answer words in the move's context: every input→answer pair plus
@@ -508,19 +379,30 @@ fn signal_werte(
 }
 
 /// Kap.-19 fallback step after a training move produced `antwort` for
-/// `eingabe` in context `kontext` (the theme digest). When the move's signal
-/// is unclear, compose ONE utterance from the configured scaffold variants
-/// plus the learned conversation word carrying the strongest contradiction;
-/// a theme at the `fallback_drossel_max` question cap gets the configured
-/// status announcement instead. Returns the utterance and whether it is the
-/// status announcement; without contradictory values or without configured
-/// scaffolds there is honestly nothing to ask (None).
+/// `eingabe` in context `kontext` (the theme digest). The konfig switch
+/// `fallback_aktivier` gates the whole flow — disarmed (the fixture
+/// default) no utterance is ever composed or appended. When armed and the
+/// move's signal is unclear, compose ONE utterance from the configured
+/// scaffold variants plus the learned conversation word carrying the
+/// strongest contradiction; a theme at the `fallback_drossel_max` question
+/// cap gets the configured status announcement instead. Returns the
+/// utterance and whether it is the status announcement; without
+/// contradictory values or without configured scaffolds there is honestly
+/// nothing to ask (None).
 pub(crate) fn fallback_schritt(
     state: &mut State,
     kontext: &str,
     eingabe: &[String],
     antwort: &[String],
 ) -> Option<(String, bool)> {
+    if !state
+        .konfig
+        .get("fallback_aktivier")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
     if eingabe.is_empty() || antwort.is_empty() {
         return None;
     }

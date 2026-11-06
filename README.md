@@ -1,4 +1,4 @@
-# Jinx-Mesh 2.6.0
+# Jinx-Mesh 2.6.1
 
 Jinx-Mesh is the project; Jinx is the name of its experimental model; the Rust executable is still named
 `saeugling`. A new vault starts with no vocabulary, neurons, connections,
@@ -7,7 +7,37 @@ provided to it. No conventional pretrained model or external embedding is used.
 The executable has no GPU or machine-learning runtime dependency and runs on
 the CPU.
 
-## What is new in 2.6.0
+## Release 2.6.1
+
+2.6.1 is a mechanics-and-delivery fix release on top of 2.6.0 (details in
+[CHANGELOG.md](CHANGELOG.md)). In short: a failed journal append now
+deactivates the mutated session instead of leaving an unloadable vault
+(fail-closed); `/undo` no longer drops unchanged edges of cold records and
+rolls back in batches so the active set stays within the 128-node budget; the
+2.6.0 anchor-word rating and implicit positive rating are removed by owner
+decision — the only rating signals are the explicit `+`/`-` prefixes and the
+repetition channel, and the Kap.-19 fallback ships disarmed
+(`fallback_aktivier`, like `mutation_aktivier`).
+
+Release delivery: `start.sh` runs exactly `bin/saeugling-linux-x86_64` — this
+shipped file is authoritative, not `target/release/saeugling`. Build with
+`cargo build --locked --release`, then copy `target/release/saeugling` to
+`bin/saeugling-linux-x86_64` before taking checksums.
+`SHA256SUMS-2.6.1.txt` is generated after that copy over the actually
+delivered files (including the `bin/` start path) and is the authoritative
+checksum manifest for this release; the older `SHA256SUMS*` files document
+earlier releases and are not authoritative for 2.6.1.
+
+Regenerate the manifest the same way, over the delivered tree without
+`.git/`, `target/`, and `private/` (user vaults are never checksummed):
+
+```sh
+find . -type f ! -path './.git/*' ! -path './target/*' ! -path './private/*' \
+  ! -name 'SHA256SUMS-2.6.1.txt' -print0 | sort -z \
+  | xargs -0 sha256sum > SHA256SUMS-2.6.1.txt
+```
+
+## What is new in 2.6
 
 This minor release merges the infant learning mechanics of the Python
 reference into the Rust runtime. Everything listed here ships as a mechanism
@@ -18,13 +48,15 @@ applies in full.
 - **Op-journal and `/undo`** — every learning move journals its exact old and
   new values before committing; each step, a range, or a whole round rolls
   back verbatim (see [Op-Journal and rollback](#op-journal-and-rollback)).
-- **Anchor words and implicit feedback** — the two anchor roots are
-  configuration data; implicit channels rate the previous reply from the
-  following move, and anchor maturation lets the anchor weight decay when
-  implicit signals agree without it.
+- **Feedback signals** — rating happens only through the explicit `+`/`-`
+  prefixes (a developer tool) and the Kap.-18 repetition channel: repeating
+  the previous question word for word rates the previous reply one negative
+  step. The 2.6.0 anchor words, the implicit positive rating, and anchor
+  maturation were removed again in 2.6.1 by owner decision.
 - **Uncertainty fallback** — a mechanically unclear signal appends one
   configurable follow-up question instead of another blind guess, throttled
-  per theme.
+  per theme. It ships disarmed: arm it by setting `fallback_aktivier` to
+  `true` in the `konfig` section (like `mutation_aktivier`).
 - **Self-healing** — `/falsch` and `/echtes_wort` fold or unfold words,
   consolidation damps contradicted edges into a suspicion ledger instead of
   deleting them, and every heal is gated by the verification-level registry.
@@ -32,8 +64,9 @@ applies in full.
   checked against data-column rules before it persists, and a test scans the
   shipped sources for hardcoded behavior strings.
 - **Novelty/mutation layer** — proposes at most one out-of-pattern word per
-  answer and never self-rewards; only external signals (`+`, an anchor word,
-  implicit use) confirm a mutant. It ships disarmed: arm it by setting
+  answer and never self-rewards; only external signals (an explicit `+` or
+  the Kap.-18 repetition signal) confirm a mutant. It ships disarmed: arm it
+  by setting
   `mutation_aktivier` to `true` in the `konfig` section of the start state
   used at `init` (the default start state is `fixtures/start.json`). Existing
   vaults keep their stored konfig unchanged.
@@ -147,12 +180,12 @@ entire paged graph.
 The model learns word frequency, order, punctuation, and graph associations.
 It does not guarantee grammar, stable identity reasoning, factual recall, or
 human-level conversation. No word such as `gut`, `nein`, or `wichtig` has an
-embedded sentiment or command meaning. The 2.6.0 mechanisms — journal
-rollback, anchor words, the uncertainty fallback, healing, the integration
-gate, and the mutation layer — are control and repair mechanics over learned
-data; they do not add semantic understanding, and every reply is still
-assembled only from learned words and transitions. These limits are part of
-the experiment.
+embedded sentiment or command meaning. The 2.6 mechanisms — journal rollback,
+explicit and repetition feedback, the uncertainty fallback, healing, the
+integration gate, and the mutation layer — are control and repair mechanics
+over learned data; they do not add semantic understanding, and every reply is
+still assembled only from learned words and transitions. These limits are
+part of the experiment.
 
 ## Existing vaults and development
 
@@ -238,43 +271,33 @@ A previous reply target survives reopening after a normal training turn. Explici
 continuations and read-only inference update the in-memory target; background
 prefetch never rates or replaces the last visible reply.
 
-## Anchor words and implicit feedback
+## Feedback signals
 
-There is no ritual feedback word. The two anchor roots are configuration data:
-`anker_plus` (default `super`) and `anker_minus` (default `nein`) in the `konfig`
-section of the start state. They are never hardcoded in code, and their words are
-ordinary learned LEX nodes with no special status — editing the config redirects
-the mechanism. When a message contains a configured anchor word as a standalone
-token, the previous reply is rated additionally to the explicit `+`/`-` system
-with the weight `anker_gewicht` (default 0.5), on top of the implicit share.
+There is no ritual feedback word. A reply is rated by exactly two signals,
+and both are mechanics over structure, never word lists:
 
-The primary channels are implicit and need no anchor word at all. Channel 1
-(execution competence) is read from the next training move by comparing two
-token sequences — pure structure recognition, no word lists: repeating the
-previous question word for word is one negative rating step; moving on to
-something new confirms lightly (`implizit_positiv`, default 0.1). An explicit
-`+`/`-` rating is the definitive signal of its move and replaces the implicit
-one; silence stays neutral. Implicit signals adjust the same bounded
-context-specific scores as explicit feedback and never enter the explicit
-feedback counters. Channel 2 (result value) is a reserved data slot
-(`kanal2_letzte`); the Block-3 fallback fills it from usage.
+- The explicit `+`/`-` prefix is the definitive rating signal of its move. It
+  is a developer tool; a sign at the start of a message hardly ever occurs by
+  chance in normal text.
+- The Kap.-18 repetition channel compares two token sequences: when an input
+  repeats the previous question word for word, the previous reply carried
+  nothing and takes one negative rating step. Moving on to something new is
+  not a signal, silence stays neutral, and an explicit `+`/`-` rating of the
+  same move replaces the implicit reading.
 
-Anchor maturation: every anchor-free implicit signal is recorded per anchor in
-`anker_maturing` (rolling window of `anker_reif_fenster`, default 50 cases).
-Once the window matches an anchor's signal in at least
-`anker_reif_ueber_einstimmig` (default 85%) of cases, the anchor weight steps
-down by `anker_reif_schritt` (default 0.05) toward `anker_gewicht_min`
-(default 0.0) — like a child understanding praise without the word. The lowered
-weight is learned data in `state.extra`, so the op-journal records every step
-exactly, rolls it back on `/undo`, and marks the move's entry with the art
-`feedback`. Vaults predating this mechanism load unchanged; the engine restores
-the missing config keys from the fixture defaults.
+The 2.6.0 anchor words (`anker_*` konfig keys) were removed by owner decision
+for 2.6.1: anchor words can occur by chance in any sentence and falsify the
+weights. Anchor maturation is gone with them, and vaults created with 2.6.0
+load unchanged. The result slot `kanal2_letzte` stays a reserved data object
+even for moves that never see the Kap.-19 fallback.
 
 ## Uncertainty fallback
 
 The Kap.-19 fallback is a mechanical uncertainty reaction, not introspection.
-After a training move that brought no anchor word and no explicit `+`/`-`
-rating, the signal is unclear when the move's conversation carries
+It ships disarmed: the whole flow is gated by the konfig switch
+`fallback_aktivier` (default `false`, like `mutation_aktivier`); only the
+vault's konfig data arms it. After a training move without an explicit
+`+`/`-` rating, the signal is unclear when the move's conversation carries
 contradictory context-feedback values in its own context: the strongest
 positive AND the strongest negative value both reach `fallback_unklar_min`
 (default 0.25; the rating channels already clamp scores to [-2, 2], which is
@@ -293,8 +316,8 @@ status announcement from `fallback_status_durchsage` instead of a further
 question.
 
 The utterance never becomes a rateable reply: the move stores no feedback
-target, so no `+`/`-` rating, no repetition comparison, and no anchor
-maturation can consume it — rating it fails honestly. The user's answer to
+target, so no `+`/`-` rating and no repetition comparison can consume it —
+rating it fails honestly. The user's answer to
 the question is a normal learning move and fills the Kap.-18 channel-2 result
 slot `kanal2_letzte` from usage (`offen` while the question waits, `ergebnis`
 with the recorded answer). Fallback events are ordinary `learn` entries in
@@ -376,8 +399,8 @@ unchanged; the engine restores the rule defaults from the fixture.
 The Kap.-20 anti-hardcode rule is enforced by a test (`test_anti_hardcode`)
 that scans every shipped `src/*.rs` file (the test file itself is the test
 filter) for string literals carrying behavior: complete sentences of more
-than three words, or any configured anchor word, question scaffold, or
-status announcement from `fixtures/start.json` — raw or with the `{wort}`
+than three words, or any configured question scaffold or status
+announcement from `fixtures/start.json` — raw or with the `{wort}`
 placeholder filled in. Error, validation, and terminal system messages are
 the allowed exception category; a behavior formulation in code fails the
 test suite. A second test feeds simulated violations through the same
@@ -406,8 +429,8 @@ discard stays in `mutations_memory` (damped, Kap.-5: failures remain
 visible) and dampens its attack point.
 
 Model-collapse protection (binding): the layer may only PROPOSE.
-Festigung happens solely through external signals — an explicit `+`, a
-configured anchor word, or the Kap.-18 implicit channel of the following
+Festigung happens solely through external signals — an explicit `+` or the
+Kap.-18 repetition signal of the following
 move. A confirmed mutant grows as a JUNGE NEURON at the mutation point (a
 fresh word is grown only by the confirmation, never by the proposal) with
 the origin visible on the node; a negatively rated mutant damps its attack

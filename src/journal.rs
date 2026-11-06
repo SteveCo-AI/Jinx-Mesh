@@ -35,8 +35,7 @@
 //! Entry arts: "learn" (one message()/train_file() learning move — a Kap.-19
 //! fallback move is an ordinary learn entry; its ops record the theme counter,
 //! scaffold rotation, channel-2 slot, and the removed feedback target),
-//! "feedback" (a move whose explicit +/- rating, Kap.-18 anchor word, or anker-weight
-//! maturation drives the change), "consolidate" (one consolidate()
+//! "feedback" (a move whose explicit +/- rating drives the change), "consolidate" (one consolidate()
 //! round; it always leaves an entry so a round boundary exists even when
 //! nothing changed), "heal" (reserved for the Block-4 dialog commands),
 //! "integration_reject" (a Kap.-24 gate refusal: no ops, the move committed

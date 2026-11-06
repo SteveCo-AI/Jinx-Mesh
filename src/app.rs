@@ -390,14 +390,9 @@ impl App {
                 // Write-ahead learning step (Kap. 14): the journal entry
                 // becomes durable before the state change commits, so a crash
                 // in between leaves an honestly discardable unconfirmed entry.
-                // Kap. 18: an anchor word rates the previous response like an
-                // explicit +/- prefix, and an anker-weight maturation is a
-                // feedback-driven adjustment — both share the art "feedback".
-                let art = if feedback.is_some()
-                    || reply.anker.is_some()
-                    || old_metadata.extra.get("anker_gewicht")
-                        != s.payload.state.extra.get("anker_gewicht")
-                {
+                // Kap. 18: an explicit +/- rating is the move's feedback
+                // signal and shares the art "feedback".
+                let art = if feedback.is_some() {
                     journal::ART_FEEDBACK
                 } else {
                     journal::ART_LEARN
@@ -446,7 +441,10 @@ impl App {
                 let mut vermerk = JournalVermerk::default();
                 if !eintrag.ops.is_empty() {
                     let kap = journal::kap(&s.engine.state);
-                    self.store.journal_append(key, &eintrag, kap)?;
+                    if let Err(e) = self.store.journal_append(key, &eintrag, kap) {
+                        self.session = None;
+                        return Err(e);
+                    }
                     vermerk.bestaetigt = Some(journal_seq);
                     neuer_eintrag = Some(eintrag);
                 }
@@ -691,7 +689,10 @@ impl App {
         }
         let kap = journal::kap(&s.engine.state);
         let key = s.key.as_ref().expect("developer key");
-        self.store.journal_append(key, &eintrag, kap)?;
+        if let Err(e) = self.store.journal_append(key, &eintrag, kap) {
+            self.session = None;
+            return Err(e);
+        }
         let vermerk = JournalVermerk {
             bestaetigt: Some(journal_seq),
             ..JournalVermerk::default()
@@ -754,68 +755,129 @@ impl App {
         }
         let alte_meta = s.payload.state.clone();
         let vor_cache = s.graph_cache.clone();
-        let mut entfernte = Vec::new();
+        let key = s.key.as_ref().expect("developer key");
+        // F04 — the chosen span is rolled back on a bounded workspace, never
+        // through the resident graph cache (that hydrated the whole span
+        // into the inference state, and Engine::active_state takes it over
+        // completely). The rollback runs in batches:
+        // 1. one store-free scan collects the records the span rewrites and
+        //    the neuron creations it deletes;
+        // 2. record bases load in pages of at most ACTIVATION_BUDGET ids
+        //    (Store::graph_nodes caps a page at 128 anyway) — resident bases
+        //    from the pre-undo slice, cold bases from the vault;
+        // 3. the journal ops apply in reverse onto those bases. Every op
+        //    stores complete old values, so the workspace ends up holding
+        //    the exact post-rollback records with COMPLETE outgoing edge
+        //    maps — cold-section exactness (Kap. 14): a neuron op may
+        //    re-insert a cold node, but the suffix's edge ops alone yield
+        //    only the span's changed edges, never the stored set a commit
+        //    must receive. Without the cold reload the commit would replace
+        //    the record's edges with that partial map and silently drop
+        //    every unchanged connection of the cold source (F02).
+        // 4. ONE atomic Store::commit persists the workspace. Commit per
+        //    batch was rejected on the existing store layout: Store::commit
+        //    is a single transaction (audit, journal suffix deletion, graph
+        //    upserts, snapshot together), and partial batch commits would
+        //    leave a half-rolled-back vault whose op-journal no longer
+        //    matches the persisted state — unrecoverable. A crash before
+        //    the commit changes nothing at all.
+        // Peak memory: the workspace grows with the span, but only as the
+        // commit payload — Store::commit seals every changed record inside
+        // its transaction regardless. The resident inference slice and
+        // every store read stay bounded at 128 nodes throughout.
         let mut ops_gesamt = 0usize;
-        for eintrag in s.journal[start..].iter().rev() {
-            entfernte.extend(journal::zurueckrollen(
-                &mut s.graph_cache,
-                &mut s.payload.state,
-                eintrag,
-            )?);
-            ops_gesamt += eintrag.ops.len();
-        }
-        // Cold-section exactness (Kap. 14): a rolled-back edge op can
-        // reference a source record the current working set no longer holds
-        // (a later activation replaced the resident slice). The vault still
-        // keeps that record and the journal's old value must reach it, so
-        // every such record is reloaded and the suffix's edge ops are
-        // re-applied to the stored edge map; the resident case was already
-        // restored in the cache above. Without this, the restored edge would
-        // never be committed and the view would silently lose the node.
-        let kalte_quellen: std::collections::BTreeSet<String> = s.journal[start..]
+        // alt=None marks a neuron the step created; undoing the creating
+        // step deletes the record instead of rewriting it.
+        let mut geloeschte = std::collections::BTreeSet::new();
+        let mut beruehrte = std::collections::BTreeSet::new();
+        for op in s.journal[start..]
             .iter()
             .flat_map(|eintrag| eintrag.ops.iter())
-            .filter(|op| {
-                op.kind == "kante"
-                    && !s.graph_cache.nodes.contains_key(&op.ziel)
-                    && !entfernte.contains(&op.ziel)
-            })
-            .map(|op| op.ziel.clone())
-            .collect();
-        let kalte_quellen: Vec<String> = kalte_quellen.into_iter().collect();
-        let key = s.key.as_ref().expect("developer key");
-        for chunk in kalte_quellen.chunks(128) {
-            let page = self.store.graph_nodes(key, chunk)?;
-            for (id, node) in page.nodes {
-                let mut edges = page.edges.get(&id).cloned().unwrap_or_default();
-                for eintrag in s.journal[start..].iter().rev() {
-                    for op in eintrag
-                        .ops
-                        .iter()
-                        .rev()
-                        .filter(|op| op.kind == "kante" && op.ziel == id)
-                    {
-                        let Some(ziel) = &op.name else {
-                            continue;
-                        };
-                        match op.alt.as_ref().and_then(serde_json::Value::as_f64) {
-                            Some(gewicht) => {
-                                edges.insert(ziel.clone(), gewicht);
-                            }
-                            None => {
-                                edges.remove(ziel);
-                            }
-                        }
-                    }
-                }
-                s.graph_cache.nodes.insert(id.clone(), node);
-                s.graph_cache.edges.insert(id, edges);
+        {
+            ops_gesamt += 1;
+            if op.kind == "neuron" && op.alt.is_none() {
+                geloeschte.insert(op.ziel.clone());
+            } else if op.kind == "neuron" || op.kind == "kante" {
+                beruehrte.insert(op.ziel.clone());
             }
         }
+        let mut arbeitscache = GraphSlice::default();
+        for id in &beruehrte {
+            if let Some(node) = vor_cache.nodes.get(id) {
+                arbeitscache.nodes.insert(id.clone(), node.clone());
+                arbeitscache.edges.insert(
+                    id.clone(),
+                    vor_cache.edges.get(id).cloned().unwrap_or_default(),
+                );
+            }
+        }
+        let kalte_quellen: Vec<String> = beruehrte
+            .iter()
+            .filter(|id| !vor_cache.nodes.contains_key(*id) && !geloeschte.contains(*id))
+            .cloned()
+            .collect();
+        // Reads precede every mutation, so a failed page load leaves the
+        // session untouched. From the first rolled-back op on, every error
+        // discards the session instead (fail closed, F01 pattern).
+        for chunk in kalte_quellen.chunks(ACTIVATION_BUDGET) {
+            let page = self.store.graph_nodes(key, chunk)?;
+            for (id, node) in page.nodes {
+                arbeitscache.nodes.insert(id.clone(), node);
+                arbeitscache
+                    .edges
+                    .insert(id.clone(), page.edges.get(&id).cloned().unwrap_or_default());
+            }
+        }
+        let mut entfernte = Vec::new();
+        for eintrag in s.journal[start..].iter().rev() {
+            match journal::zurueckrollen(&mut arbeitscache, &mut s.payload.state, eintrag) {
+                Ok(weg) => entfernte.extend(weg),
+                Err(fehler) => {
+                    self.session = None;
+                    return Err(fehler);
+                }
+            }
+        }
+        // Post-undo resident slice: the restored records first, untouched
+        // pre-undo residents fill the remaining budget — never larger than
+        // the 128-node activation budget. The cap applies ONLY to the
+        // inference working set; the commit below persists every touched
+        // record exactly, so no edge is lost to a truncated cache.
+        let mut nach_cache = GraphSlice::default();
+        for (id, node) in &arbeitscache.nodes {
+            if nach_cache.nodes.len() >= ACTIVATION_BUDGET {
+                break;
+            }
+            nach_cache.nodes.insert(id.clone(), node.clone());
+            nach_cache.edges.insert(
+                id.clone(),
+                arbeitscache.edges.get(id).cloned().unwrap_or_default(),
+            );
+        }
+        for (id, node) in &vor_cache.nodes {
+            if nach_cache.nodes.len() >= ACTIVATION_BUDGET {
+                break;
+            }
+            if nach_cache.nodes.contains_key(id) || entfernte.contains(id) {
+                continue;
+            }
+            nach_cache.nodes.insert(id.clone(), node.clone());
+            nach_cache.edges.insert(
+                id.clone(),
+                vor_cache.edges.get(id).cloned().unwrap_or_default(),
+            );
+        }
+        s.graph_cache = nach_cache;
         let aktiv = Engine::active_state(&s.payload.state, &s.graph_cache);
-        s.engine = Engine::new(aktiv, s.payload.actions.clone())?;
+        match Engine::new(aktiv, s.payload.actions.clone()) {
+            Ok(engine) => s.engine = engine,
+            Err(fehler) => {
+                self.session = None;
+                return Err(fehler);
+            }
+        }
         s.feedback_target = s.payload.state.extra.get("feedback_target").cloned();
-        let graph_updates = changed_graph(&vor_cache, &s.graph_cache);
+        let graph_updates = arbeitscache;
         let streichen_ab = s.journal[start].seq;
         let zurueck = s.journal.len() - start;
         s.journal.truncate(start);
@@ -988,8 +1050,13 @@ impl App {
             },
         )?;
         let kap = journal::kap(&s.engine.state);
-        self.store
-            .journal_append(s.key.as_ref().expect("developer key"), &eintrag, kap)?;
+        if let Err(e) =
+            self.store
+                .journal_append(s.key.as_ref().expect("developer key"), &eintrag, kap)
+        {
+            self.session = None;
+            return Err(e);
+        }
         let vermerk = JournalVermerk {
             bestaetigt: Some(journal_seq),
             ..JournalVermerk::default()
@@ -1090,8 +1157,13 @@ impl App {
             },
         )?;
         let kap = journal::kap(&s.engine.state);
-        self.store
-            .journal_append(s.key.as_ref().expect("developer key"), &eintrag, kap)?;
+        if let Err(e) =
+            self.store
+                .journal_append(s.key.as_ref().expect("developer key"), &eintrag, kap)
+        {
+            self.session = None;
+            return Err(e);
+        }
         let vermerk = JournalVermerk {
             bestaetigt: Some(journal_seq),
             ..JournalVermerk::default()
@@ -1244,8 +1316,13 @@ impl App {
         let mut vermerk = JournalVermerk::default();
         if !eintrag.ops.is_empty() {
             let kap = journal::kap(&s.engine.state);
-            self.store
-                .journal_append(s.key.as_ref().expect("developer key"), &eintrag, kap)?;
+            if let Err(e) =
+                self.store
+                    .journal_append(s.key.as_ref().expect("developer key"), &eintrag, kap)
+            {
+                self.session = None;
+                return Err(e);
+            }
             vermerk.bestaetigt = Some(journal_seq);
             neuer_eintrag = Some(eintrag);
         }

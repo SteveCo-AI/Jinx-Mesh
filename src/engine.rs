@@ -11,20 +11,12 @@ pub(crate) struct Engine {
     pub state: State,
 }
 
-/// Kap.-18 anchor configuration keys restored from the fixture state.
-const KAP18_KONFIG: [&str; 8] = [
-    "anker_gewicht",
-    "anker_gewicht_min",
-    "anker_minus",
-    "anker_plus",
-    "anker_reif_fenster",
-    "anker_reif_schritt",
-    "anker_reif_ueber_einstimmig",
-    "implizit_positiv",
-];
-
-/// Kap.-19 fallback configuration keys restored from the fixture state.
-const KAP19_KONFIG: [&str; 4] = [
+/// Kap.-19 fallback configuration keys restored from the fixture state
+/// (the question scaffolds and status texts are pattern data, never code
+/// strings; the `fallback_aktivier` switch ships disarmed like the
+/// mutation layer's).
+const KAP19_KONFIG: [&str; 5] = [
+    "fallback_aktivier",
     "fallback_drossel_max",
     "fallback_frage_geruest",
     "fallback_status_durchsage",
@@ -87,12 +79,11 @@ impl Engine {
                 serde_json::json!(crate::journal::KAP_STANDARD),
             );
         }
-        // Vaults predating the Kap.-18 anchor mechanism and the Kap.-19
-        // fallback lack their konfig keys. The fixture state is the single
-        // data source for the defaults (the anchor words and the fallback
-        // scaffolds are configuration data, never code strings), so every
-        // reader sees a complete mechanism.
-        konfig_ergaenzen(&mut state, &KAP18_KONFIG);
+        // Vaults predating the Kap.-19 fallback lack its konfig keys. The
+        // fixture state is the single data source for the defaults (the
+        // fallback scaffolds are configuration data, never code strings), so
+        // every reader sees a complete mechanism; the flow itself ships
+        // disarmed and only the vault's konfig data arms it.
         konfig_ergaenzen(&mut state, &KAP19_KONFIG);
         // Same for the Kap.-21/22 heal keys (the dialog heal patterns are
         // configuration data); the verification-source registry itself lives
@@ -130,7 +121,6 @@ impl Engine {
             neue_neuronen: 0,
             activation: None,
             feedback: None,
-            anker: None,
             fallback: None,
             mutation: None,
         })
@@ -147,11 +137,11 @@ impl Engine {
         let parsed = language::parse(text);
         let tokens = parsed.words.clone();
         // Kap. 18: this move also rates the previous response through the
-        // configured anchor word and the implicit channel. The explicit +/-
-        // rating below consumes the stored target, so both the target and
-        // the signals are read before it runs.
+        // implicit repetition channel. The explicit +/- rating below consumes
+        // the stored target, so both the target and the signal are read
+        // before it runs.
         let ziel = self.state.extra.get("feedback_target").cloned();
-        let signale = language::signale_lesen(&self.state, &tokens, feedback, ziel.as_ref());
+        let signale = language::signale_lesen(&tokens, feedback, ziel.as_ref());
         if let Some(value) = feedback {
             language::apply_feedback(&mut self.state, value)?;
         }
@@ -221,11 +211,12 @@ impl Engine {
                 mutation = Some(vorschlag.wort);
             }
         }
-        // Kap. 19: with no anchor word and no explicit rating in this move, a
-        // contradictory signal appends ONE fallback utterance to the normal
-        // answer instead of leaving another bare guess.
+        // Kap. 19: without an explicit rating in this move, a contradictory
+        // signal appends ONE fallback utterance to the normal answer instead
+        // of leaving another bare guess — but only when the vault's konfig
+        // data armed the (disarmed-by-default) flow.
         let mut fallback = None;
-        if feedback.is_none() && signale.anker.is_none() && !output.is_empty() {
+        if feedback.is_none() && !output.is_empty() {
             if let Some((aeusserung, durchsage)) = language::fallback_schritt(
                 &mut self.state,
                 &kontext,
@@ -239,8 +230,8 @@ impl Engine {
                     "nachfrage".to_owned()
                 });
                 // The fallback utterance is never the rateable target: no
-                // rating, repetition comparison, or anchor maturation may
-                // consume it, and the user's next move learns normally.
+                // rating or repetition comparison may consume it, and the
+                // user's next move learns normally.
                 self.state.extra.remove("feedback_target");
                 // Phase 2.5: a fallback answer is never rateable either, so
                 // its pending proposal expires unverwertet — no festigung
@@ -274,7 +265,6 @@ impl Engine {
             neue_neuronen: added,
             activation: None,
             feedback,
-            anker: signale.anker.map(|(wort, _)| wort),
             fallback,
             mutation,
         })

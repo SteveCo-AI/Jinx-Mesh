@@ -11,11 +11,10 @@
 //!
 //! Model-collapse protection (binding, cf. arXiv:2310.01798): the layer may
 //! only PROPOSE. Festigung of a mutant word happens solely through external
-//! signals — an explicit +/- rating, a configured anchor word, or the
-//! Kap.-18 implicit channel of the following user move; selection acceptance
-//! alone changes nothing structural. In /freeze and locked mode the layer
-//! never runs: it lives exclusively in the training move, and frozen
-//! inference stays read-only.
+//! signals — an explicit +/- rating or the Kap.-18 repetition signal of the
+//! following user move; selection acceptance alone changes nothing
+//! structural. In /freeze and locked mode the layer never runs: it lives
+//! exclusively in the training move, and frozen inference stays read-only.
 //!
 //! Mutations-Wegweiser: a small sparse table in state.extra (bounded like
 //! every learned run, oldest entries rotate out — the ring discipline) that
@@ -572,9 +571,9 @@ pub(crate) fn verfallen(state: &mut State) {
 }
 
 /// External signals decide the pending proposal (model-collapse protection,
-/// binding): an explicit +/- rating, a configured anchor word, or the
-/// Kap.-18 implicit channel of this move — and only those. The layer never
-/// rewards its own wildness; a proposal without a signal stays a proposal.
+/// binding): an explicit +/- rating or the Kap.-18 repetition signal of this
+/// move — and only those. The layer never rewards its own wildness; a
+/// proposal without a signal stays a proposal.
 pub(crate) fn bewerten(
     state: &mut State,
     signale: &language::Signale,
@@ -589,11 +588,8 @@ pub(crate) fn bewerten(
     let Some(ziel) = ziel else {
         return;
     };
-    let anker = signale.anker.as_ref().map(|(_, richtung)| *richtung);
-    let positiv =
-        explizit == Some(1) || anker == Some(1) || signale.implizit.is_some_and(|d| d > 0.0);
-    let negativ =
-        explizit == Some(-1) || anker == Some(-1) || signale.implizit.is_some_and(|d| d < 0.0);
+    let positiv = explizit == Some(1);
+    let negativ = explizit == Some(-1) || signale.wiederholung;
     if !positiv && !negativ {
         return;
     }

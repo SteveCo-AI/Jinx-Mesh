@@ -114,7 +114,6 @@ impl State {
             "structure_observations",
             "context_feedback",
             "feedback_counts",
-            "anker_maturing",
             "kanal2_letzte",
             "fallback_pro_thema",
         ] {
@@ -141,15 +140,6 @@ impl State {
                 {
                     bail!("Ungültiges Bewertungsziel");
                 }
-            }
-        }
-        // Learned current anchor weight; absent means the konfig start value.
-        if let Some(gewicht) = self.extra.get("anker_gewicht") {
-            let Some(gewicht) = gewicht.as_f64() else {
-                bail!("Ungültiges Anker-Gewicht");
-            };
-            if !gewicht.is_finite() || !(0.0..=2.0).contains(&gewicht) {
-                bail!("Ungültiges Anker-Gewicht");
             }
         }
         // Kap.-18 channel-2 slot, filled by the Kap.-19 fallback flow: an open
@@ -212,59 +202,18 @@ impl State {
                 bail!("Ungültige Konfiguration: journal_kap");
             }
         }
-        // Kap.-18 anchor configuration. Every key stays optional so vaults
-        // predating the mechanism load unchanged; Engine::new restores the
-        // fixture defaults. The words are configuration data, never code
-        // strings, and each must be a single token.
-        for key in ["anker_plus", "anker_minus"] {
-            if let Some(wort) = self.konfig.get(key) {
-                if crate::language::parse(wort.as_str().unwrap_or(""))
-                    .words
-                    .len()
-                    != 1
-                {
-                    bail!("Ungültige Konfiguration: {key}");
-                }
+        // Kap.-19 fallback configuration. Optional like the other mechanism
+        // keys so vaults predating the flow (or its switch) load unchanged;
+        // Engine::new restores the fixture defaults. The question scaffolds
+        // and status texts are configuration data, never code strings; each
+        // array carries several bounded non-empty variants so the rotation
+        // has data to choose from. The `fallback_aktivier` switch ships
+        // disarmed: only the vault's konfig data arms the flow.
+        if let Some(value) = self.konfig.get("fallback_aktivier") {
+            if value.as_bool().is_none() {
+                bail!("Ungültige Konfiguration: fallback_aktivier");
             }
         }
-        if let (Some(plus), Some(minus)) = (
-            self.konfig.get("anker_plus").and_then(Value::as_str),
-            self.konfig.get("anker_minus").and_then(Value::as_str),
-        ) {
-            if crate::language::parse(plus).words == crate::language::parse(minus).words {
-                bail!("Anker-Wörter müssen verschieden sein");
-            }
-        }
-        for (key, bereich) in [
-            ("anker_gewicht", 0.0..=2.0),
-            ("anker_gewicht_min", 0.0..=2.0),
-            ("implizit_positiv", 0.0..=2.0),
-            ("anker_reif_schritt", 0.0..=1.0),
-            ("anker_reif_ueber_einstimmig", 0.0..=1.0),
-            ("anker_reif_fenster", 1.0..=10_000.0),
-        ] {
-            if let Some(value) = self.konfig.get(key) {
-                let Some(v) = value.as_f64() else {
-                    bail!("Ungültige Konfiguration: {key}");
-                };
-                if !v.is_finite() || !bereich.contains(&v) {
-                    bail!("Ungültige Konfiguration: {key}");
-                }
-            }
-        }
-        if let (Some(gewicht), Some(minimum)) = (
-            self.konfig.get("anker_gewicht").and_then(Value::as_f64),
-            self.konfig.get("anker_gewicht_min").and_then(Value::as_f64),
-        ) {
-            if minimum > gewicht {
-                bail!("anker_gewicht_min übersteigt anker_gewicht");
-            }
-        }
-        // Kap.-19 fallback configuration. Optional like the Kap.-18 keys so
-        // vaults predating the mechanism load unchanged; Engine::new restores
-        // the fixture defaults. The question scaffolds and status texts are
-        // configuration data, never code strings; each array carries several
-        // bounded non-empty variants so the rotation has data to choose from.
         for (key, bereich) in [
             ("fallback_unklar_min", 0.0..=2.0),
             ("fallback_drossel_max", 1.0..=1000.0),
@@ -545,9 +494,6 @@ impl State {
 pub struct Reply {
     #[serde(default)]
     pub feedback: Option<i8>,
-    /// Kap.-18 anchor word that fired in this move (konfig data, not code).
-    #[serde(default)]
-    pub anker: Option<String>,
     /// Kap.-19 fallback utterance appended to this move: "nachfrage" or
     /// "durchsage" (mechanical marker, never behavior text).
     #[serde(default)]

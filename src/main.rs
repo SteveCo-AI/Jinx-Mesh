@@ -96,7 +96,7 @@ fn main() {
 fn run() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "--help" {
-        println!("Jinx 2.6.0\n  saeugling init VAULT [STATE_JSON ACTIONS_JSON [LEGACY_AUDIT]]\n  saeugling chat VAULT\nAnmeldedaten werden ausschließlich verdeckt im Terminal eingegeben.");
+        println!("Jinx {}\n  saeugling init VAULT [STATE_JSON ACTIONS_JSON [LEGACY_AUDIT]]\n  saeugling chat VAULT\nAnmeldedaten werden ausschließlich verdeckt im Terminal eingegeben.", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if args[0] == "init" {

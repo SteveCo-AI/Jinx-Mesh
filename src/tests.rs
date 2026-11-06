@@ -525,7 +525,7 @@ fn op_journal_kap_verfaellt_die_aeltesten_laesst_die_neuesten_rueckholbar() {
     assert_eq!(app.status().unwrap()["journal_länge"], 0);
 }
 
-// ---- Phase-2 Block 2: Anker-Wörter + implizite Feedback-Kanäle (Kap. 18) ----
+// ---- Phase-2 Block 2: Explizites Feedback + Wiederholungs-Kanal (Kap. 18) ----
 
 /// Bias the rating channels leave for one target edge in one context.
 fn bias_fuer(e: &Engine, ctx: &str, prev: Option<&str>, wort: &str) -> f64 {
@@ -548,120 +548,85 @@ fn engine_mit(konfig: &[(&str, Value)]) -> Engine {
 }
 
 #[test]
-fn ankerwort_bewertet_die_vorherige_antwort_staerker_als_ohne() {
+fn ankerwoerter_sind_gewoehnliche_woerter_und_loesen_keine_bewertung_aus() {
     let ctx = crate::language::context("hallo welt");
-    // Identical setup; only the follow-up move differs.
-    let mut mit_anker = engine();
-    mit_anker.train("hallo welt").unwrap();
-    let reply = mit_anker.train("super danke").unwrap();
-    assert_eq!(reply.anker.as_deref(), Some("super"));
-    let mut ohne_anker = engine();
-    ohne_anker.train("hallo welt").unwrap();
-    ohne_anker.train("danke sehr").unwrap();
-    // The anchor adds its full configured weight on top of the implicit
-    // continuation signal (Kap. 18: zusätzlich zum impliziten Anteil).
-    let mit = bias_fuer(&mit_anker, &ctx, None, "hallo");
-    let ohne = bias_fuer(&ohne_anker, &ctx, None, "hallo");
-    assert!((mit - 0.6).abs() < 1e-9);
-    assert!((ohne - 0.1).abs() < 1e-9);
-    assert!((mit - ohne - 0.5).abs() < 1e-9);
-
-    // The minus root fires symmetrically.
-    let mut min_anker = engine();
-    min_anker.train("hallo welt").unwrap();
-    let reply = min_anker.train("nein danke").unwrap();
-    assert_eq!(reply.anker.as_deref(), Some("nein"));
-    let bias = bias_fuer(&min_anker, &ctx, None, "hallo");
-    assert!(bias < 0.0);
-    assert!((bias + 0.4).abs() < 1e-9);
-
-    // Only a standalone token fires, never a substring.
-    let mut teilwort = engine();
-    teilwort.train("hallo welt").unwrap();
-    let reply = teilwort.train("supersache danke").unwrap();
-    assert_eq!(reply.anker, None);
-    assert!((bias_fuer(&teilwort, &ctx, None, "hallo") - 0.1).abs() < 1e-9);
+    // V01 (owner decision, binding): the former anchor words are ordinary
+    // words. Appearing in a normal message rates nothing through any
+    // channel — neither the plus root...
+    let mut e = engine();
+    e.train("hallo welt").unwrap();
+    let reply = e.train("super danke").unwrap();
+    assert_eq!(reply.feedback, None);
+    assert!((bias_fuer(&e, &ctx, None, "hallo") - 0.0).abs() < 1e-9);
+    // ...nor the minus root.
+    let reply = e.train("nein danke").unwrap();
+    assert_eq!(reply.feedback, None);
+    assert!((bias_fuer(&e, &ctx, None, "hallo") - 0.0).abs() < 1e-9);
+    // A plain continuation is not a signal either (the implicit positive
+    // channel is gone): only a repeated question rates.
+    let mut fortsetzung = engine();
+    fortsetzung.train("hallo welt").unwrap();
+    fortsetzung.train("danke sehr").unwrap();
+    assert!((bias_fuer(&fortsetzung, &ctx, None, "hallo") - 0.0).abs() < 1e-9);
+    // The word itself learns as ordinary vocabulary; no anchor bookkeeping
+    // key ever appears.
+    assert!(graph::word(&e.state, "super").is_some());
+    assert!(!e.state.extra.contains_key("anker_maturing"));
+    assert!(!e.state.extra.contains_key("anker_gewicht"));
+    assert!(!e.state.extra.contains_key("feedback_counts"));
 }
 
 #[test]
-fn wiederholte_frage_ohne_anker_wirkt_implizit_negativ() {
+fn wiederholte_frage_wirkt_implizit_negativ() {
     let mut e = engine();
     e.train("was ist los").unwrap();
     let ctx = crate::language::context("was ist los");
     let vor = bias_fuer(&e, &ctx, None, "was");
     let reply = e.train("was ist los").unwrap();
-    assert_eq!(reply.anker, None);
     assert_eq!(reply.feedback, None);
     // One negative rating step is visible in the bias values...
     let nach = bias_fuer(&e, &ctx, None, "was");
     assert!((nach - vor + 0.25).abs() < 1e-9);
-    // ...and in the maturing window, but never in the explicit counters.
+    // ...but never in the explicit counters.
     assert!(!e.state.extra.contains_key("feedback_counts"));
-    assert_eq!(
-        e.state.extra["anker_maturing"]["super"]["fenster"],
-        json!(["negativ"])
-    );
-    assert_eq!(
-        e.state.extra["anker_maturing"]["super"]["negativ"],
-        json!(1)
-    );
-    assert_eq!(
-        e.state.extra["anker_maturing"]["nein"]["fenster"],
-        json!(["negativ"])
-    );
-    // A new question continues positively instead.
+    // A new question is no signal at all: the bias stays as it is and no
+    // implicit bookkeeping key appears.
     e.train("ganz andere sache").unwrap();
-    assert_eq!(
-        e.state.extra["anker_maturing"]["super"]["positiv"],
-        json!(1)
-    );
-    assert_eq!(
-        e.state.extra["anker_maturing"]["super"]["fenster"],
-        json!(["negativ", "positiv"])
-    );
+    assert!((bias_fuer(&e, &ctx, None, "was") - nach).abs() < 1e-9);
+    assert!(!e.state.extra.contains_key("anker_maturing"));
+    assert!(!e.state.extra.contains_key("feedback_counts"));
 }
 
 #[test]
-fn anker_reifung_nach_50_konformen_faellen_senkt_gewicht_und_protokolliert() {
+fn explizite_bewertung_journiert_als_feedback_und_rollt_exakt_zurueck() {
     let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("anker-reifung.db");
+    let db = dir.path().join("feedback-art.db");
     let mut app = crate::App::create_empty(&db, "jinx", JOURNAL_PASS, None, None).unwrap();
     app.login("jinx", JOURNAL_PASS, None).unwrap();
     app.message("eins zwei").unwrap();
-    // 50 konforme Fälle: every continuation without an anchor word and
-    // without an explicit rating is an implicit positive signal for the
-    // plus root.
+    // 50 continuation moves stay plain learn entries: the implicit positive
+    // channel is gone, nothing matures, nothing reweights.
     for i in 0..50 {
         app.message(&format!("novum{i} wechsel{i}")).unwrap();
     }
     let abschnitt = app.test_abschnitt();
-    assert_eq!(abschnitt["extra"]["anker_gewicht"], json!(0.45));
-    assert_eq!(
-        abschnitt["extra"]["anker_maturing"]["super"]["positiv"],
-        json!(50)
-    );
-    assert_eq!(
-        abschnitt["extra"]["anker_maturing"]["super"]["fenster"]
-            .as_array()
-            .unwrap()
-            .len(),
-        50
-    );
-    // The maturation is protolled as a feedback journal entry (Kap. 14/18).
-    let status = app.status().unwrap();
-    assert_eq!(status["journal_letzter"]["art"], "feedback");
-    // And it is exactly rollbackable: the learned override disappears and
-    // the weight falls back to the configured start value.
+    assert!(abschnitt["extra"].get("anker_gewicht").is_none());
+    assert!(abschnitt["extra"].get("anker_maturing").is_none());
+    assert_eq!(app.status().unwrap()["journal_letzter"]["art"], "learn");
+    // An explicit + rating journals as art "feedback"...
+    app.message("+ weiter so").unwrap();
+    assert_eq!(app.status().unwrap()["journal_letzter"]["art"], "feedback");
+    // ...and rolls back exactly; the previous learn step is the last one
+    // again.
     let report = app.undo(1).unwrap();
     assert_eq!(report["zurueckgerollt"], 1);
-    assert_eq!(app.test_abschnitt()["extra"]["anker_gewicht"], Value::Null);
+    assert_eq!(app.status().unwrap()["journal_letzter"]["art"], "learn");
 }
 
 #[test]
 fn ankerwoerter_sind_regulaere_lex_knoten_und_lernen_wie_alle_anderen() {
     let mut e = engine();
-    let reply = e.train("super sache").unwrap();
-    assert_eq!(reply.anker.as_deref(), Some("super"));
+    e.train("super sache").unwrap();
     {
         let node = &e.state.neuronen["lex:super"];
         assert_eq!(node.typ, "LEX");
@@ -684,31 +649,6 @@ fn ankerwoerter_sind_regulaere_lex_knoten_und_lernen_wie_alle_anderen() {
 }
 
 #[test]
-fn anker_erkennung_folgt_der_konfig_nicht_dem_code() {
-    let ctx = crate::language::context("hallo welt");
-    // Default konfig data: "super" is the plus root.
-    let mut a = engine();
-    a.train("hallo welt").unwrap();
-    let reply = a.train("super danke").unwrap();
-    assert_eq!(reply.anker.as_deref(), Some("super"));
-    assert!((bias_fuer(&a, &ctx, None, "hallo") - 0.6).abs() < 1e-9);
-
-    // Editing the konfig data redirects the mechanism: "super" becomes
-    // ordinary vocabulary, the configured word fires instead.
-    let mut b = engine_mit(&[("anker_plus", json!("toll"))]);
-    b.train("hallo welt").unwrap();
-    let reply = b.train("super danke").unwrap();
-    assert_eq!(reply.anker, None);
-    assert!((bias_fuer(&b, &ctx, None, "hallo") - 0.1).abs() < 1e-9);
-
-    let mut c = engine_mit(&[("anker_plus", json!("toll"))]);
-    c.train("hallo welt").unwrap();
-    let reply = c.train("toll danke").unwrap();
-    assert_eq!(reply.anker.as_deref(), Some("toll"));
-    assert!((bias_fuer(&c, &ctx, None, "hallo") - 0.6).abs() < 1e-9);
-}
-
-#[test]
 fn kanal2_bleibt_in_diesem_block_ein_unbefuellter_datenslot() {
     let mut e = engine();
     e.train("hallo welt").unwrap();
@@ -723,48 +663,44 @@ fn kanal2_bleibt_in_diesem_block_ein_unbefuellter_datenslot() {
 }
 
 #[test]
-fn anker_konfig_wird_validiert_und_fehlende_keys_fallen_auf_die_startwerte_zurueck() {
-    // New konfig keys are range-checked (single-token anchor words, weight
-    // bands, maturation thresholds, floor below the start weight).
+fn alte_vaults_mit_ankerdaten_laden_weiter_und_bleiben_inert() {
+    // V01: the anchor mechanism is gone. Vaults written before the decision
+    // carry its konfig keys and learned extra data — both stay loadable
+    // (serde's flattened extra tolerates them) and nothing reads or writes
+    // them anymore.
     let mut s = State::empty();
-    s.konfig.insert("anker_gewicht".into(), json!(5.0));
-    assert!(s.validate().is_err());
-    let mut s = State::empty();
-    s.konfig.insert("anker_gewicht".into(), json!(0.1));
-    s.konfig.insert("anker_gewicht_min".into(), json!(0.5));
-    assert!(s.validate().is_err());
-    let mut s = State::empty();
-    s.konfig.insert("anker_plus".into(), json!("zwei woerter"));
-    assert!(s.validate().is_err());
-    let mut s = State::empty();
-    s.konfig.insert("anker_minus".into(), json!("super"));
-    assert!(s.validate().is_err());
-
-    // Vault compatibility: a state without the Kap.-18 keys (every vault
-    // predating the mechanism) still validates and loads...
-    let mut s = State::empty();
-    for key in [
-        "anker_gewicht",
-        "anker_gewicht_min",
-        "anker_minus",
-        "anker_plus",
-        "anker_reif_fenster",
-        "anker_reif_schritt",
-        "anker_reif_ueber_einstimmig",
-        "implizit_positiv",
+    for (key, wert) in [
+        ("anker_plus", json!("super")),
+        ("anker_minus", json!("nein")),
+        ("anker_gewicht", json!(0.5)),
+        ("anker_gewicht_min", json!(0.0)),
+        ("anker_reif_fenster", json!(50)),
+        ("anker_reif_schritt", json!(0.05)),
+        ("anker_reif_ueber_einstimmig", json!(0.85)),
+        ("implizit_positiv", json!(0.1)),
     ] {
-        s.konfig.remove(key);
+        s.konfig.insert(key.into(), wert);
     }
+    s.extra.insert(
+        "anker_maturing".into(),
+        json!({"super": {"positiv": 3, "negativ": 0, "nutzungen": 2, "fenster": ["positiv"]}}),
+    );
+    s.extra.insert("anker_gewicht".into(), json!(0.45));
     assert!(s.validate().is_ok());
-    // ...and Engine::new restores the configured defaults from the fixture
-    // state, so the mechanism is complete without code-side words.
     let mut e = Engine::new(s, json!({"aktionen":{}})).unwrap();
-    assert_eq!(e.state.konfig["anker_plus"], json!("super"));
-    assert_eq!(e.state.konfig["anker_minus"], json!("nein"));
-    assert_eq!(e.state.konfig["anker_gewicht"], json!(0.5));
+    let ctx = crate::language::context("hallo welt");
     e.train("hallo welt").unwrap();
+    // The legacy anchor word behaves like every ordinary word: no rating.
     let reply = e.train("super danke").unwrap();
-    assert_eq!(reply.anker.as_deref(), Some("super"));
+    assert_eq!(reply.feedback, None);
+    assert!((bias_fuer(&e, &ctx, None, "hallo") - 0.0).abs() < 1e-9);
+    // The legacy data survives untouched: nothing writes it anymore.
+    assert_eq!(
+        e.state.extra["anker_maturing"]["super"]["nutzungen"],
+        json!(2)
+    );
+    assert_eq!(e.state.extra["anker_gewicht"], json!(0.45));
+    assert!(e.state.validate().is_ok());
 }
 
 #[test]
@@ -795,6 +731,91 @@ fn undo_stellt_kanten_kalter_quellen_auch_im_vault_exakt_wieder_her() {
     assert_eq!(abschnitt["neuronen"]["lex:wort"]["nutzt"], json!(1));
 }
 
+#[test]
+fn undo_runde_grosser_spanne_ueber_rundengrenze_haelt_budget_und_kanten_exakt() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("undo-spanne.db");
+    let mut app = crate::App::create_empty(&db, "jinx", JOURNAL_PASS, None, None).unwrap();
+    app.login("jinx", JOURNAL_PASS, None).unwrap();
+    // 26 blocks of 5 unique words: 130 nodes — more cold sources than one
+    // 128-record rollback page, so the undo must batch its store reads.
+    let wort = |i: usize, j: usize| {
+        let bytes = Sha256::digest(format!("spanne-{i}-{j}"));
+        format!(
+            "w{}",
+            bytes[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        )
+    };
+    let bloecke: Vec<String> = (0..26)
+        .map(|i| (0..5).map(|j| wort(i, j)).collect::<Vec<_>>().join(" "))
+        .collect();
+    for block in &bloecke {
+        app.message(block).unwrap();
+    }
+    app.message("alpha bravo").unwrap();
+    app.message("alpha charlie").unwrap();
+    // Exact pre-round weights, read through the frozen inference path —
+    // /undo round restores the state from BEFORE the boundary (inclusive).
+    drop(app);
+    let mut app = crate::App::open(&db).unwrap();
+    app.login("jinx", JOURNAL_PASS, None).unwrap();
+    app.freeze().unwrap();
+    app.message("alpha bravo charlie").unwrap();
+    let kante = |blick: &Value, von: &str, nach: &str| {
+        blick["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["from"] == von && e["to"] == nach)
+            .and_then(|e| e["weight"].as_f64())
+            .unwrap()
+    };
+    let blick = app.graph_view();
+    let alt_ab = kante(&blick, "lex:alpha", "lex:bravo");
+    let alt_ac = kante(&blick, "lex:alpha", "lex:charlie");
+    drop(app);
+    let mut app = crate::App::open(&db).unwrap();
+    app.login("jinx", JOURNAL_PASS, None).unwrap();
+    app.consolidate().unwrap();
+    // The round after the boundary retrains every block (weight changes on
+    // all 130 words), retrains alpha->bravo, and ends with a fresh block
+    // whose new words evict every touched record from the resident slice.
+    for block in &bloecke {
+        app.message(block).unwrap();
+    }
+    app.message("alpha bravo").unwrap();
+    let frisch: String = (0..5).map(|j| wort(99, j)).collect::<Vec<_>>().join(" ");
+    app.message(&frisch).unwrap();
+    // /undo round across the boundary: the consolidate entry plus 28 learns,
+    // every touched source cold, more than one 128-record page to reload.
+    let report = app.undo_runde().unwrap();
+    assert_eq!(report["zurueckgerollt"], 29);
+    assert_eq!(report["journal_länge"], 28);
+    let status = app.status().unwrap();
+    assert!(
+        status["active_nodes"].as_u64().unwrap() <= 128,
+        "Undo must not hydrate the rolled-back span into the resident set"
+    );
+    // The fresh block's words were created inside the round and must be
+    // gone; the 130 retrained words and alpha/bravo/charlie survive.
+    assert_eq!(status["neurons"], 133);
+    assert_eq!(app.verify_graph_full().unwrap(), 133);
+    drop(app);
+    // Reopen: the restored alpha->bravo weight and the untouched
+    // alpha->charlie edge must be exact in the vault, not cache remnants.
+    let mut app = crate::App::open(&db).unwrap();
+    app.login("jinx", JOURNAL_PASS, None).unwrap();
+    app.freeze().unwrap();
+    app.message("alpha bravo charlie").unwrap();
+    let blick = app.graph_view();
+    assert_eq!(kante(&blick, "lex:alpha", "lex:bravo"), alt_ab);
+    assert_eq!(kante(&blick, "lex:alpha", "lex:charlie"), alt_ac);
+}
+
 // ---- Phase-2 Block 3: Unsicherheits-Fallback (Kap. 19) ----
 
 /// Pair key of the rating channels for one context-feedback entry.
@@ -805,9 +826,12 @@ fn paar(prev: Option<&str>, wort: &str) -> String {
 /// Kap.-19 mechanism fixture: a small graph where "a b" walks the answer
 /// path "a b c", with contradictory context-feedback ratings in the "a b"
 /// theme (positive on the c step, negative on the input→answer pair a→c)
-/// and a second, independent "b a" theme with its own contradiction.
+/// and a second, independent "b a" theme with its own contradiction. The
+/// flow ships disarmed (V01), so the tests exercising its mechanics arm it
+/// through the konfig data — the same opt-in the mutation tests use.
 fn fallback_state() -> State {
     let mut s = State::empty();
+    s.konfig.insert("fallback_aktivier".into(), json!(true));
     for wort in ["a", "b", "c"] {
         let id = format!("lex:{wort}");
         s.neuronen.insert(
@@ -869,6 +893,39 @@ fn geruest_voll(key: &str, index: usize, wort: &str) -> String {
 }
 
 #[test]
+fn fallback_ist_standardmaessig_aus_ohne_konfig_aktivierung() {
+    // V01 (owner decision, binding): the scaffold flow ships disarmed —
+    // `fallback_aktivier` defaults to false in the fixture data and only
+    // the vault's konfig arms it (the mutation_aktivier pattern).
+    assert_eq!(State::empty().konfig["fallback_aktivier"], json!(false));
+    let mut s = fallback_state();
+    s.konfig.insert("fallback_aktivier".into(), json!(false));
+    let mut e = Engine::new(s, json!({})).unwrap();
+    // The plain answer comes back untouched...
+    let erste = e.train("a b").unwrap();
+    assert_eq!(erste.fallback, None);
+    assert_eq!(erste.text, "a b c.");
+    // ...also when the question repeats (the repetition channel keeps
+    // marking the start word, which may redirect the walked path — the
+    // point here is that never a scaffold text is appended).
+    for _ in 0..2 {
+        let reply = e.train("a b").unwrap();
+        assert_eq!(reply.fallback, None);
+        for key in ["fallback_frage_geruest", "fallback_status_durchsage"] {
+            let varianten = State::empty().konfig[key].as_array().unwrap().len();
+            for variante in 0..varianten {
+                assert!(!reply.text.contains(&geruest_voll(key, variante, "c")));
+            }
+        }
+    }
+    // The disarmed flow leaves no bookkeeping and opens no channel-2
+    // question.
+    assert!(!e.state.extra.contains_key("fallback_pro_thema"));
+    assert!(!e.state.extra.contains_key("fallback_geruest_zaehler"));
+    assert!(e.state.extra["kanal2_letzte"].get("offen").is_none());
+}
+
+#[test]
 fn fallback_gemischtes_signal_ergaenzt_geruest_und_gelerntes_wort() {
     let mut e = Engine::new(fallback_state(), json!({})).unwrap();
     let reply = e.train("a b").unwrap();
@@ -898,7 +955,8 @@ fn fallback_gemischtes_signal_ergaenzt_geruest_und_gelerntes_wort() {
 
 #[test]
 fn gemischtes_signal_entsteht_aus_natuerlichem_dialog_und_wird_gedrosselt() {
-    let mut e = engine();
+    // The flow is opt-in data (V01): arming it through the konfig, not code.
+    let mut e = engine_mit(&[("fallback_aktivier", json!(true))]);
     // Natural conversation: the question "p q" is corrected negatively, its
     // answer flips, a continuation is taught, and a positive correction
     // follows — the "p q" theme then carries contradictory ratings and the
@@ -1097,45 +1155,26 @@ fn kanal2_letzte_wird_vom_fallback_aus_nutzung_befuellt() {
 }
 
 #[test]
-fn die_nachfrage_wird_nie_zum_bewertungs_oder_reifungsziel() {
+fn die_nachfrage_wird_nie_zum_bewertungsziel() {
     let mut e = Engine::new(fallback_state(), json!({})).unwrap();
     e.train("a b").unwrap(); // question appended; no rateable target remains
     assert!(!e.state.extra.contains_key("feedback_target"));
     let feedback_vorher = e.state.extra["context_feedback"].clone();
-    let maturing_vorher = e
-        .state
-        .extra
-        .get("anker_maturing")
-        .cloned()
-        .unwrap_or(json!({}));
     // Repeating the question as the answer — normally an implicit negative
-    // on the previous response — rates nothing here and matures nothing.
+    // on the previous response — rates nothing here: no target exists.
     let reply = e.train("a b").unwrap();
     assert_eq!(reply.fallback.as_deref(), Some("nachfrage")); // still unclear, asked again
     assert_eq!(e.state.extra["context_feedback"], feedback_vorher);
-    assert_eq!(
-        e.state
-            .extra
-            .get("anker_maturing")
-            .cloned()
-            .unwrap_or(json!({})),
-        maturing_vorher
-    );
     assert!(!e.state.extra.contains_key("feedback_target"));
     // An explicit +/- on the question fails honestly: nothing rateable exists.
     assert!(e.train("+ doch").is_err());
-    // An anchor word in the answer still learns as an ordinary node and
-    // counts its use, but with no target it rates nothing and matures nothing.
+    // A normal word in the answer still learns as an ordinary node, but
+    // with no target it rates nothing.
     e.train("super vielleicht").unwrap();
-    assert_eq!(
-        e.state.extra["anker_maturing"]["super"]["nutzungen"],
-        json!(1)
-    );
-    assert_eq!(
-        e.state.extra["anker_maturing"]["super"]["fenster"],
-        json!([])
-    );
     assert!(graph::word(&e.state, "super").is_some());
+    assert_eq!(e.state.extra["context_feedback"], feedback_vorher);
+    // No anchor bookkeeping ever appears (V01: the mechanism is gone).
+    assert!(!e.state.extra.contains_key("anker_maturing"));
 }
 
 #[test]
@@ -1164,24 +1203,6 @@ fn ohne_widerspruch_oder_mit_bewertung_gibt_es_keinen_fallback() {
     assert_eq!(reply.feedback, Some(-1));
     assert_eq!(reply.fallback, None);
     assert_eq!(reply.text, "a b c.");
-
-    // Same with a configured anchor word (its token legitimately becomes part
-    // of the mirrored answer — the point is that no utterance is appended).
-    let mut s = fallback_state();
-    s.extra.insert(
-        "feedback_target".into(),
-        crate::language::target("x y", "x y."),
-    );
-    let mut e = Engine::new(s, json!({})).unwrap();
-    let reply = e.train("super a b").unwrap();
-    assert_eq!(reply.anker.as_deref(), Some("super"));
-    assert_eq!(reply.fallback, None);
-    for key in ["fallback_frage_geruest", "fallback_status_durchsage"] {
-        let varianten = State::empty().konfig[key].as_array().unwrap().len();
-        for variante in 0..varianten {
-            assert!(!reply.text.contains(&geruest_voll(key, variante, "super")));
-        }
-    }
 }
 
 #[test]
@@ -1205,6 +1226,10 @@ fn fallback_konfig_wird_validiert_und_alte_vaults_fallen_auf_die_startwerte_zuru
         .insert("fallback_status_durchsage".into(), json!("kein array"));
     assert!(s.validate().is_err());
     let mut s = State::empty();
+    s.konfig
+        .insert("fallback_aktivier".into(), json!("vielleicht"));
+    assert!(s.validate().is_err());
+    let mut s = State::empty();
     s.extra.insert("fallback_pro_thema".into(), json!([]));
     assert!(s.validate().is_err());
     let mut s = State::empty();
@@ -1216,9 +1241,10 @@ fn fallback_konfig_wird_validiert_und_alte_vaults_fallen_auf_die_startwerte_zuru
     assert!(s.validate().is_err());
 
     // Vault compatibility: a state without the Kap.-19 keys (every vault
-    // predating the mechanism) still validates...
+    // predating the mechanism or its switch) still validates...
     let mut s = State::empty();
     for key in [
+        "fallback_aktivier",
         "fallback_drossel_max",
         "fallback_frage_geruest",
         "fallback_status_durchsage",
@@ -1229,6 +1255,9 @@ fn fallback_konfig_wird_validiert_und_alte_vaults_fallen_auf_die_startwerte_zuru
     assert!(s.validate().is_ok());
     // ...and Engine::new restores the configured defaults from the fixture.
     let e = Engine::new(s, json!({"aktionen":{}})).unwrap();
+    // The restored switch stays disarmed: only the vault's konfig data arms
+    // the flow (V01).
+    assert_eq!(e.state.konfig["fallback_aktivier"], json!(false));
     assert_eq!(e.state.konfig["fallback_unklar_min"], json!(0.25));
     assert_eq!(e.state.konfig["fallback_drossel_max"], json!(2));
     assert!(
@@ -2613,24 +2642,18 @@ fn mutations_konfig_wird_validiert_und_alte_vaults_fallen_auf_die_startwerte() {
     assert_eq!(e.state.konfig["mutation_wildheit_schritt"], json!(0.2));
 }
 
-/// Behavior texts from the konfig fixture (Kap. 20): the anchor words plus
-/// every configured fallback scaffold and status announcement, split around
-/// the `{wort}` placeholder so a code literal with the placeholder filled
-/// in is caught as well.
+/// Behavior texts from the konfig fixture (Kap. 20): every configured
+/// fallback scaffold and status announcement, split around the `{wort}`
+/// placeholder so a code literal with the placeholder filled in is caught
+/// as well. The former anchor words are ordinary vocabulary since V01 and
+/// are no behavior data.
 struct Verhaltenstexte {
-    worte: Vec<String>,
     texte: Vec<String>,
     fragmente: Vec<(String, String)>,
 }
 
 fn verhaltenstexte() -> Verhaltenstexte {
     let konfig = State::empty().konfig;
-    let mut worte = Vec::new();
-    for key in ["anker_plus", "anker_minus"] {
-        if let Some(wort) = konfig[key].as_str() {
-            worte.push(wort.to_lowercase());
-        }
-    }
     let mut texte = Vec::new();
     let mut fragmente = Vec::new();
     for key in ["fallback_frage_geruest", "fallback_status_durchsage"] {
@@ -2650,11 +2673,7 @@ fn verhaltenstexte() -> Verhaltenstexte {
             }
         }
     }
-    Verhaltenstexte {
-        worte,
-        texte,
-        fragmente,
-    }
+    Verhaltenstexte { texte, fragmente }
 }
 
 /// Whether position i opens a char literal (`'x'`, `'\n'`, `'…'`) rather
@@ -2906,14 +2925,11 @@ const MELDUNGS_KONTEXT: [&str; 11] = [
 
 /// Kap.-20 check of one literal: a violation is (1) a complete sentence of
 /// more than three words — exempt inside the message call contexts — or
-/// (2) any configured behavior text (anchor word, question scaffold, status
+/// (2) any configured behavior text (question scaffold, status
 /// announcement), raw or with the `{wort}` placeholder filled in — never
 /// exempt.
 fn ist_verhaltenstraeger(text: &str, kontext: &str, texte: &Verhaltenstexte) -> Option<String> {
     let klein = text.to_lowercase();
-    if let Some(wort) = texte.worte.iter().find(|w| klein.contains(w.as_str())) {
-        return Some(format!("ankerwort {wort} im literal: {text}"));
-    }
     if let Some(t) = texte.texte.iter().find(|t| klein.contains(t.as_str())) {
         return Some(format!("konfig-text {t} im literal: {text}"));
     }
@@ -2946,12 +2962,11 @@ fn verletzungen_in(inhalt: &str, texte: &Verhaltenstexte) -> Vec<String> {
 
 #[test]
 fn test_anti_hardcode() {
-    // Kap. 20: formulations, triggers, anchors, and thresholds never live as
-    // code strings — only as konfig data or learned state. The scan reads
-    // every shipped src/*.rs file (the test file itself is the test filter
+    // Kap. 20: formulations, triggers, and thresholds never live as code
+    // strings — only as konfig data or learned state. The scan reads every
+    // shipped src/*.rs file (the test file itself is the test filter
     // exception) and fails loudly on any behavior carrier.
     let texte = verhaltenstexte();
-    assert!(texte.worte.iter().all(|w| !w.is_empty()));
     assert!(texte.texte.len() >= 4);
     assert!(texte.fragmente.len() >= 4);
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -2986,8 +3001,6 @@ fn test_anti_hardcode_greift_beim_simulierten_verhaltensstring() {
         .to_owned();
     let snippet = format!(r#"let text = "{geruest}";"#);
     assert!(!verletzungen_in(&snippet, &texte).is_empty());
-    // ...an anchor word...
-    assert!(!verletzungen_in(r#"let wort = "super";"#, &texte).is_empty());
     // ...a scaffold with the placeholder filled in...
     assert!(!verletzungen_in(
         r#"let text = "ich bin mir bei kaffee noch unsicher";"#,
@@ -3000,6 +3013,9 @@ fn test_anti_hardcode_greift_beim_simulierten_verhaltensstring() {
         &texte
     )
     .is_empty());
+    // Ordinary vocabulary is no behavior data since V01: the former
+    // anchor words must not trip the guard.
+    assert!(verletzungen_in(r#"let wort = "super";"#, &texte).is_empty());
     // Exceptions stay clean: an error message...
     assert!(verletzungen_in(
         r#"bail!("nachricht ueberschreitet das aktivierungsbudget von 128 woertern");"#,
@@ -3017,22 +3033,15 @@ fn test_anti_hardcode_greift_beim_simulierten_verhaltensstring() {
     // ...and short mechanical identifiers.
     assert!(verletzungen_in(r#"let art = "integration_reject";"#, &texte).is_empty());
     // A full simulated source file: comments and #[cfg(test)] bodies are
-    // the test filter, live code is not.
-    let datei = concat!(
-        "fn live() {\n",
-        "    // ein kommentar bleibt ein kommentar\n",
-        "    let a = \"kurz\";\n",
-        "    let b = \"super\";\n",
-        "}\n",
-        "#[cfg(test)]\n",
-        "mod tests {\n",
-        "    fn t() { let c = \"super aus dem test\"; }\n",
-        "}\n",
+    // the test filter, live code is not. The scaffold literal is composed
+    // from the konfig data so this test file itself stays free of it.
+    let datei = format!(
+        "fn live() {{\n    // ein kommentar bleibt ein kommentar\n    let a = \"kurz\";\n    let b = \"{geruest}\";\n}}\n#[cfg(test)]\nmod tests {{\n    fn t() {{ let c = \"{geruest} aus dem test\"; }}\n}}\n"
     );
-    let verletzungen = verletzungen_in(datei, &texte);
-    // Only the live "super" remains: the comment was stripped and the
-    // #[cfg(test)] body never ships.
+    let verletzungen = verletzungen_in(&datei, &texte);
+    // Only the live scaffold literal remains: the comment was stripped and
+    // the #[cfg(test)] body never ships.
     assert_eq!(verletzungen.len(), 1);
-    assert!(verletzungen[0].contains("super"));
+    assert!(verletzungen[0].contains("konfig-text"));
     assert!(verletzungen[0].contains("im literal"));
 }

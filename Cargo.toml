@@ -1,6 +1,6 @@
 [package]
 name = "saeugling"
-version = "2.6.0"
+version = "2.6.1"
 edition = "2021"
 description = "Jinx: local continuously learning graph with an authenticated encrypted developer vault"
 
@@ -24,6 +24,8 @@ zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [profile.release]
 lto = "thin"
