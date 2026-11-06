@@ -1,0 +1,25 @@
+{
+  "schema_version": "2.0.0-alpha.2",
+  "konfig": {
+    "auto_slaap_ab": 60,
+    "daempf_faktor": 0.7,
+    "max_neu_pro_nachricht": 12,
+    "max_pfad_len": 12,
+    "paar_basis": 0.2,
+    "paar_deckel": 0.95,
+    "paar_zuwachs": 0.1,
+    "praezise_ab_nutzt": 3,
+    "staerke_zuwachs": 0.05,
+    "start_staerke": 0.2,
+    "reif_ab_nutzt": 5
+  },
+  "neuronen": {},
+  "kanten": {},
+  "interaktionen": 0,
+  "letzte_slaap": 0,
+  "anker": {},
+  "formulierungen": {},
+  "historie": [],
+  "kontext": {},
+  "lab": {}
+}
