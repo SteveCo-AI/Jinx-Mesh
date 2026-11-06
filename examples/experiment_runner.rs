@@ -24,8 +24,8 @@ fn long_words(text: &str) -> Vec<String> {
 
 /// A config text array within its permitted size range; empty entries are
 /// rejected because every message must be a reproducible learning input.
-fn text_list(config: &Value, field: &str, min: usize, max: usize) -> Result<Vec<String>> {
-    let list = match config[field].as_array() {
+fn text_list(value: &Value, field: &str, min: usize, max: usize) -> Result<Vec<String>> {
+    let list = match value.as_array() {
         Some(list) if (min..=max).contains(&list.len()) => list,
         _ => bail!("{field} muss ein Array aus {min} bis {max} Textnachrichten sein"),
     };
@@ -80,7 +80,7 @@ impl Experiment {
 
     /// One measurement: state and graph first, then the probe answer via
     /// read-only inference with the evaluate() assert that nothing persisted.
-    fn record(&mut self, app: &mut App, label: u64) -> Result<()> {
+    fn record(&mut self, app: &mut App, label: Value) -> Result<()> {
         let status = app.status()?;
         let graph = app.graph_view();
         let before = status["interactions"].clone();
@@ -109,8 +109,12 @@ impl Experiment {
             .collect();
         let probe_answer = serde_json::to_value(&reply)?;
         let probe_words = serde_json::to_value(&probe_words_in_graph)?;
+        let label_text = match label.as_str() {
+            Some(text) => text.to_string(),
+            None => label.to_string(),
+        };
         println!(
-            "Messung {label}: Abruf {retrieval}, {} aktive Knoten, {} s",
+            "Messung {label_text}: Abruf {retrieval}, {} aktive Knoten, {} s",
             status["active_nodes"],
             self.start.elapsed().as_secs()
         );
@@ -178,8 +182,15 @@ fn main() -> Result<()> {
         Some(e) if !e.trim().is_empty() => e.to_string(),
         _ => bail!("experiment.json benötigt probe.expected als nicht leeren Text"),
     };
-    let intro = text_list(&config, "intro", 1, 20)?;
-    let distractors = text_list(&config, "distractors", 1, 5000)?;
+    let intro = text_list(&config["intro"], "intro", 1, 20)?;
+    // Reinforcement lines go to the app verbatim: a leading +/- rating prefix
+    // is meaningful there (the app evaluates the previous answer), so it is
+    // neither stripped nor validated here.
+    let reinforce = match &config["reinforce"] {
+        Value::Null => Vec::new(),
+        v => text_list(v, "reinforce", 0, 50)?,
+    };
+    let distractors = text_list(&config["distractors"], "distractors", 1, 5000)?;
     let grid = cumulative_grid(&config)?;
     let total = grid[grid.len() - 1];
     fs::copy(&initial_vault, &working)?;
@@ -225,17 +236,24 @@ fn main() -> Result<()> {
         dir,
         query,
         expected,
-        summary: json!({"grid": grid, "intro_count": intro.len(), "distractor_count": distractors.len()}),
+        summary: json!({"grid": grid, "intro_count": intro.len(), "distractor_count": distractors.len(), "reinforce_count": reinforce.len()}),
         snapshots: Vec::new(),
         start: Instant::now(),
     };
     experiment.progress("training", 0)?;
-    experiment.record(&mut app, 0)?;
+    experiment.record(&mut app, json!(0))?;
     for text in &intro {
         app.message(text)?;
         experiment.progress("training", 0)?;
     }
-    experiment.record(&mut app, 1)?;
+    experiment.record(&mut app, json!(1))?;
+    for text in &reinforce {
+        app.message(text)?;
+        experiment.progress("training", 0)?;
+    }
+    if !reinforce.is_empty() {
+        experiment.record(&mut app, json!("post_reinforce"))?;
+    }
     let mut fed: u64 = 0;
     let mut index = 0usize;
     for &n in &grid {
@@ -245,7 +263,7 @@ fn main() -> Result<()> {
             fed += 1;
             experiment.progress("training", fed)?;
         }
-        experiment.record(&mut app, n)?;
+        experiment.record(&mut app, json!(n))?;
     }
     experiment.progress("complete", total)?;
     println!(
