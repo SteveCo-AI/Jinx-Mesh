@@ -50,6 +50,11 @@ second copy of the message.
 
 Messages are limited to 128 tokenizer tokens and 16 KiB of UTF-8 text; file imports are
 limited to 128 tokens and 256 KiB. These bounds keep the working set manageable.
+Up to 128 new word nodes can be learned per message, within the resident graph
+budget. Generated graph paths stop at observed sentence punctuation (`. ! ? …`),
+a missing continuation, or a safety cap of 128 word nodes. Existing vaults using
+the original twelve-word defaults automatically receive the increased budgets
+when loaded by the engine; their learned graph is preserved.
 If a graph traversal reaches its per-call budget, the reply is marked as
 budget-limited and may be continued. The encrypted traversal checkpoint keeps
 its query, compact frontier, visited IDs, and provisional output, and is

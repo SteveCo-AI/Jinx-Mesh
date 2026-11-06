@@ -3,8 +3,8 @@
   "konfig": {
     "auto_slaap_ab": 60,
     "daempf_faktor": 0.7,
-    "max_neu_pro_nachricht": 12,
-    "max_pfad_len": 12,
+    "max_neu_pro_nachricht": 128,
+    "max_pfad_len": 128,
     "paar_basis": 0.2,
     "paar_deckel": 0.95,
     "paar_zuwachs": 0.1,

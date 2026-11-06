@@ -173,7 +173,7 @@ fn graph_budget_consolidation_and_unicode() {
                 .join(" "),
         )
         .unwrap();
-    assert!(r.neue_neuronen <= 12);
+    assert_eq!(r.neue_neuronen, 100);
     let count = e.state.neuronen.len();
     for _ in 0..100 {
         graph::consolidate(&mut e.state);
@@ -202,4 +202,24 @@ fn malformed_state_rejected() {
         .unwrap()
         .validate()
         .is_err());
+}
+
+#[test]
+fn long_learned_sentence_is_not_cut_after_twelve_words() {
+    let mut old = State::empty();
+    old.konfig.insert("max_pfad_len".into(), json!(12));
+    old.konfig.insert("max_neu_pro_nachricht".into(), json!(12));
+    let mut e = Engine::new(old, json!({})).unwrap();
+    let mut words: Vec<_> = (0..40).map(|i| format!("langwort{i}")).collect();
+    words.last_mut().unwrap().push('.');
+    let text = words.join(" ");
+    assert_eq!(e.train(&text).unwrap().neue_neuronen, 40);
+    assert_eq!(e.infer("langwort0").unwrap().text, text);
+}
+
+#[test]
+fn learned_output_stops_at_observed_sentence_boundary() {
+    let mut e = engine();
+    e.train("eins zwei. drei vier.").unwrap();
+    assert_eq!(e.infer("eins").unwrap().text, "eins zwei.");
 }

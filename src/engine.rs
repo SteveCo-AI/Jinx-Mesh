@@ -11,8 +11,15 @@ pub(crate) struct Engine {
     pub state: State,
 }
 impl Engine {
-    pub fn new(state: State, _legacy_spec: Value) -> Result<Self> {
+    pub fn new(mut state: State, _legacy_spec: Value) -> Result<Self> {
         state.validate()?;
+        // Upgrade the original twelve-word defaults in existing vaults as well.
+        // Learned nodes and connections are preserved.
+        for key in ["max_neu_pro_nachricht", "max_pfad_len"] {
+            if state.number(key) == 12.0 {
+                state.konfig.insert(key.into(), serde_json::json!(128));
+            }
+        }
         Ok(Self { state })
     }
     pub fn infer(&self, text: &str) -> Result<Reply> {

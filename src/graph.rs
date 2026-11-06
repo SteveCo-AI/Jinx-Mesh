@@ -158,6 +158,9 @@ fn neighbors(state: &State, a: &str, prev: Option<&str>, used: &[String]) -> Vec
     });
     ns.into_iter().map(|(id, _)| id.clone()).collect()
 }
+fn sentence_end(state: &State, id: &str) -> bool {
+    state.neuronen[id].label.ends_with(['.', '!', '?', '…'])
+}
 fn walk(state: &State, start: &str) -> Path {
     let mut p = Path {
         nodes: vec![start.into()],
@@ -165,6 +168,9 @@ fn walk(state: &State, start: &str) -> Path {
     };
     while p.nodes.len() < (state.number("max_pfad_len") as usize) {
         let a = p.nodes.last().unwrap().clone();
+        if sentence_end(state, &a) {
+            break;
+        }
         let prev = p.nodes.iter().rev().nth(1).map(String::as_str);
         let ns = neighbors(state, &a, prev, &p.nodes);
         if ns.is_empty() {
@@ -175,6 +181,7 @@ fn walk(state: &State, start: &str) -> Path {
             alt.push(ns[1].clone());
             while alt.len() < (state.number("max_pfad_len") as usize)
                 && state.neuronen[alt.last().unwrap()].typ != "KERN"
+                && !sentence_end(state, alt.last().unwrap())
             {
                 let prev = alt.iter().rev().nth(1).map(String::as_str);
                 let next = neighbors(state, alt.last().unwrap(), prev, &alt);
