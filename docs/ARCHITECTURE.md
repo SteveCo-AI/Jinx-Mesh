@@ -15,11 +15,11 @@ the CLI's idle worker also stops when frozen, logged out, or expired.
 | `journal.rs` | Encrypted op journal: append, undo (steps/round), crash recovery fails closed |
 | `gate.rs` | Integration gate: rules as data, rejects recorded as `integration_reject` |
 | `mutation.rs` | Phase-2.5 novelty operator (off by default), folding detection, `/falsch` + `/echtes_wort` healing |
-| `app.rs` | Authentication boundary, graph activation, recall, checkpoint, and session coordination (largest coordinator; planned de-splintering, see WARTUNG.md) |
-| `store.rs` | Format-2 compatibility and format-3 encrypted paging, manifests, receipts, and archive (planned de-splintering, see WARTUNG.md) |
+| `app/` | Authentication boundary, chat/training moves, undo/heal, recall and checkpoint coordination, bounded activation — split by domain, see WARTUNG.md |
+| `store/` | Vault access and commit, op-journal, conversation archive, format-2/3 encrypted paging and manifests — split by domain, see WARTUNG.md |
 | `crypto.rs` | Password key derivation, bounded compression, AEAD and key handling |
 | `main.rs` | CLI, hidden credentials, truthful progress, and idle prefetch scheduling |
-| `tests.rs` | Library test suite (planned split by module, see WARTUNG.md) |
+| `tests/` | Library test suite split by domain (basics, journal, undo, feedback, fallback, healing, gate, mutation, release guard), see WARTUNG.md |
 
 ## Format 3 and lazy graph activation
 
@@ -93,15 +93,12 @@ remain stored; canonical matching reuses punctuation-bearing aliases lazily.
 
 ## Maintenance backlog (2.6.2 wave)
 
-The module structure is sound; no rebuild is needed. Scheduled stepwise work
-for the next maintenance wave (not part of a feature release):
+The module structure is sound; no rebuild is needed. The scheduled
+de-splintering of `app.rs`, `store.rs`, and `tests.rs` is complete: the
+per-domain module map, the splitting rules, and the next candidates live in
+WARTUNG.md. Beyond that:
 
-1. Split `app.rs` (~2,067 lines): auth, chat/training, undo/heal, import, recall
-   coordination each get a clear owner.
-2. Split `store.rs` (~1,250 lines): DB access, encryption, graph paging, and
-   archive each get a clear owner.
-3. Reorganize `tests.rs` (~3,047 lines) by module.
-4. Keep this document aligned with the version header each release.
+1. Keep this document aligned with the version header each release.
 
 Order rule holds: measurement waves (RW-1) take precedence over structural
 refactoring — the experiment measures the shipped 2.6.1 mechanics, so the
