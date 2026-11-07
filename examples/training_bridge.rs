@@ -22,6 +22,18 @@
 //!   a message whose text is exactly "+" or "-". The interactions counter
 //!   grows by exactly one (a rating is a learning-adjacent turn, Kap. 18);
 //!   that is correct and expected.
+//! * `{"id","op":"correction","target_reply_id","value":"plus"|"minus",
+//!   "text"}` — Raphael correction form: `text` is the CORRECTED answer.
+//!   Exactly-once and staleness are checked like the rate op (one rated set
+//!   covers both ops), then a text that itself starts with +/- is refused
+//!   ("prefixed_text"). The turn is one `app.message()` whose text is the
+//!   rating prefix + the corrected answer (e.g. `"+regenbogen"`): the engine
+//!   rates the previous reply in its own context AND learns the text as a
+//!   normal training turn — the native split_feedback path
+//!   (src/language.rs:57-66). The response carries the turn's own new
+//!   `reply_id` (which becomes the next rateable target when the engine
+//!   reports `feedback_available`), the reply `text`, and the interactions
+//!   count.
 //! * `{"id","op":"status"}` — `app.status()`.
 //! * `{"id","op":"consolidate"}` — `app.consolidate()`: one consolidation
 //!   round; `result` is the engine's own JSON summary. On Err the engine
@@ -42,7 +54,7 @@
 //! only (src/graph.rs:386), and the engine itself refuses '/' command texts
 //! (src/engine.rs:331-334).
 //!
-//! Every train/rate/read_only request+result is appended to
+//! Every train/rate/correction/read_only request+result is appended to
 //! `<VAULT>.events.jsonl` at occurrence, one flushed line per event.
 use anyhow::{Context, Result};
 use saeugling::{App, Mode, SessionPolicy};
@@ -189,6 +201,7 @@ impl Bridge {
             "train" => (self.op_train(id, &request), false),
             "read_only" => (self.op_read_only(id, &request), false),
             "rate" => (self.op_rate(id, &request), false),
+            "correction" => (self.op_correction(id, &request), false),
             "status" => (self.op_status(id), false),
             "consolidate" => (self.op_consolidate(id), false),
             "checkpoint" => (self.op_checkpoint(id, &request), false),
@@ -578,6 +591,153 @@ impl Bridge {
         }
     }
 
+    /// Raphael correction form: `text` is the CORRECTED answer. One engine
+    /// message whose text is the rating prefix + the corrected answer makes
+    /// the engine rate the previous reply in its own context AND learn the
+    /// text as a normal training turn (the native split_feedback path,
+    /// src/language.rs:57-66). Exactly-once is the rate op's: one rated set
+    /// covers both ops, so a target rated by either cannot be rated again.
+    fn op_correction(&mut self, id: u64, request: &Value) -> Value {
+        let args = json!({
+            "target_reply_id": request.get("target_reply_id").cloned().unwrap_or(Value::Null),
+            "value": request.get("value").cloned().unwrap_or(Value::Null),
+            "text": request.get("text").cloned().unwrap_or(Value::Null),
+        });
+        let Some(target) = request.get("target_reply_id").and_then(Value::as_u64) else {
+            return self.fail_response(
+                id,
+                "correction",
+                &args,
+                None,
+                "malformed_request: correction needs an integer field \"target_reply_id\"".into(),
+            );
+        };
+        let value = match request.get("value").and_then(Value::as_str) {
+            Some(v) => v,
+            None => return self.fail_response(
+                id,
+                "correction",
+                &args,
+                Some(target),
+                "malformed_request: correction needs a string field \"value\" (\"plus\" or \"minus\")"
+                    .into(),
+            ),
+        };
+        let rating = match value {
+            "plus" => "+",
+            "minus" => "-",
+            other => {
+                return self.fail_response(
+                    id,
+                    "correction",
+                    &args,
+                    Some(target),
+                    format!("invalid_value: expected \"plus\" or \"minus\", got {other:?}"),
+                )
+            }
+        };
+        let Some(text) = request.get("text").and_then(Value::as_str) else {
+            return self.fail_response(
+                id,
+                "correction",
+                &args,
+                Some(target),
+                "malformed_request: correction needs a string field \"text\" (the corrected answer)"
+                    .into(),
+            );
+        };
+        // Exactly-once and staleness first, checked exactly like the rate op:
+        // a rejection has no side effects at all.
+        if self.rated.contains(&target) {
+            return self.fail_response(
+                id,
+                "correction",
+                &args,
+                Some(target),
+                "already_rated".into(),
+            );
+        }
+        if self.rateable != Some(target) {
+            return self.fail_response(
+                id,
+                "correction",
+                &args,
+                Some(target),
+                "stale_target".into(),
+            );
+        }
+        // The corrected answer must not carry its own rating prefix: the
+        // engine splits the combined message once and trims the remainder
+        // (src/language.rs:57-66), so a leading +/- would survive into the
+        // learned text and blur the correction form's meaning.
+        let stripped = text.trim_start();
+        if stripped.starts_with('+') || stripped.starts_with('-') {
+            return self.fail_response(
+                id,
+                "correction",
+                &args,
+                Some(target),
+                "prefixed_text".into(),
+            );
+        }
+        if let Err(e) = self.ensure_session() {
+            return self.fail_response(id, "correction", &args, Some(target), e);
+        }
+        let message = format!("{rating}{text}");
+        match self.app.message(&message) {
+            Ok(reply) => {
+                self.reply_seq += 1;
+                let reply_id = self.reply_seq;
+                // The engine consumed the stored target with this move (the
+                // rating half, src/language.rs:246-258), so the id counts as
+                // rated from here on even if the status read below fails —
+                // a retry would otherwise rate whatever new target the
+                // turn stored.
+                self.rated.insert(target);
+                // The corrected-answer turn usually leaves its own reply as
+                // the engine's new rateable target; until the status read
+                // confirms it, the bridge conservatively maps no reply as
+                // rateable (a future rate answers stale_target).
+                self.rateable = None;
+                let status = match self.current_status() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return self.fail_response(
+                            id,
+                            "correction",
+                            &args,
+                            Some(reply_id),
+                            format!("correction_committed_but_status_failed: {e}"),
+                        )
+                    }
+                };
+                self.rateable = status["feedback_available"]
+                    .as_bool()
+                    .unwrap_or(false)
+                    .then_some(reply_id);
+                let mut response = json!({
+                    "id": id,
+                    "reply_id": reply_id,
+                    "ok": true,
+                    "text": reply.text,
+                    "interactions": status["interactions"].clone(),
+                });
+                self.log(&mut response, id, "correction", args, Some(reply_id));
+                response
+            }
+            // The engine restored its state exactly (gate reject or fail
+            // closed, src/app/message.rs:189-224): the id stays rateable and
+            // unrated, so a retry is legitimate.
+            Err(e) => self.fail_response(
+                id,
+                "correction",
+                &args,
+                Some(target),
+                format!("correction_failed: {e}"),
+            ),
+        }
+    }
+
     fn op_status(&mut self, id: u64) -> Value {
         if let Err(e) = self.ensure_session() {
             return error_response(id, &e);
@@ -850,6 +1010,72 @@ mod tests {
         assert_eq!(
             accepted["status"]["feedback_counts"]["negative"].as_u64(),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn correction_rates_the_target_once_and_learns_the_corrected_text() {
+        let dir = TempDir::new().unwrap();
+        let mut bridge = bridge(&dir);
+        let trained = train(&mut bridge, 1, "hallo welt");
+        let reply_id = trained["reply_id"].as_u64().unwrap();
+        let before = trained["interactions"].as_u64().unwrap();
+        let corrected = call(
+            &mut bridge,
+            json!({"id": 2, "op": "correction", "target_reply_id": reply_id, "value": "plus", "text": "regenbogen libelle"}),
+        );
+        assert!(
+            corrected["ok"].as_bool().unwrap(),
+            "correction failed: {corrected}"
+        );
+        // The correction message is a training turn of its own: it consumes
+        // the next reply id.
+        assert_eq!(corrected["reply_id"].as_u64(), Some(reply_id + 1));
+        // A correction is one learning-adjacent turn: exactly one
+        // interaction more.
+        assert_eq!(corrected["interactions"].as_u64(), Some(before + 1));
+        // (1) Exactly-once: the same target cannot be corrected again ...
+        let second = call(
+            &mut bridge,
+            json!({"id": 3, "op": "correction", "target_reply_id": reply_id, "value": "plus", "text": "noch eine korrektur"}),
+        );
+        assert_eq!(second["ok"].as_bool(), Some(false));
+        assert_eq!(second["error"].as_str().unwrap(), "already_rated");
+        // ... with zero side effects: the counter did not move ...
+        assert_eq!(second["interactions"].as_u64(), Some(before + 1));
+        // ... and the rate op on the same target is refused too (one rated
+        // set covers both ops).
+        let rated = call(
+            &mut bridge,
+            json!({"id": 4, "op": "rate", "target_reply_id": reply_id, "value": "plus"}),
+        );
+        assert_eq!(rated["error"].as_str().unwrap(), "already_rated");
+        // The rating half landed in the engine exactly once, and the
+        // correction's own reply is the new rateable target.
+        let status = call(&mut bridge, json!({"id": 5, "op": "status"}));
+        assert_eq!(
+            status["status"]["feedback_counts"]["positive"].as_u64(),
+            Some(1),
+            "exactly one correction rating reached the engine: {status}"
+        );
+        assert_eq!(
+            status["status"]["feedback_available"].as_bool(),
+            Some(true),
+            "the correction turn's own reply must be the new rateable target: {status}"
+        );
+        // (3) The learning half landed too: a read-only query over the
+        // distinctive correction words returns them — render_path outputs
+        // only learned graph nodes (src/language.rs:147-176), so the words
+        // in the reply are neurons grown by the correction turn.
+        let read = call(
+            &mut bridge,
+            json!({"id": 6, "op": "read_only", "text": "regenbogen"}),
+        );
+        assert!(read["ok"].as_bool().unwrap(), "read_only failed: {read}");
+        let text = read["text"].as_str().unwrap();
+        assert!(
+            text.contains("regenbogen") && text.contains("libelle"),
+            "the corrected text must be learned: {read}"
         );
     }
 
