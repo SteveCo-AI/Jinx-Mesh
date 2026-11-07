@@ -23,6 +23,12 @@
 //!   grows by exactly one (a rating is a learning-adjacent turn, Kap. 18);
 //!   that is correct and expected.
 //! * `{"id","op":"status"}` — `app.status()`.
+//! * `{"id","op":"consolidate"}` — `app.consolidate()`: one consolidation
+//!   round; `result` is the engine's own JSON summary. On Err the engine
+//!   has already restored its exact pre-round state (the Kap.-24 gate
+//!   reject persists a rejection marker and bails,
+//!   src/app/message.rs:383-401), so the error is passed through and a
+//!   retry is legitimate.
 //! * `{"id","op":"checkpoint","path"}` — refused: App exposes no
 //!   consistent-snapshot API; checkpointing happens exclusively by clean
 //!   shutdown (see [`Bridge::op_checkpoint`]).
@@ -184,6 +190,7 @@ impl Bridge {
             "read_only" => (self.op_read_only(id, &request), false),
             "rate" => (self.op_rate(id, &request), false),
             "status" => (self.op_status(id), false),
+            "consolidate" => (self.op_consolidate(id), false),
             "checkpoint" => (self.op_checkpoint(id, &request), false),
             // Shutdown answers first; serve() then returns and main drops the
             // App (flush/close), removes the socket file, exits 0.
@@ -581,6 +588,16 @@ impl Bridge {
         }
     }
 
+    fn op_consolidate(&mut self, id: u64) -> Value {
+        if let Err(e) = self.ensure_session() {
+            return error_response(id, &e);
+        }
+        match self.app.consolidate() {
+            Ok(result) => json!({"id": id, "ok": true, "result": result}),
+            Err(e) => error_response(id, &format!("consolidate_failed: {e}")),
+        }
+    }
+
     fn op_checkpoint(&mut self, id: u64, request: &Value) -> Value {
         // "path" is accepted but deliberately unused: no copy is ever made.
         let _path = request.get("path");
@@ -891,6 +908,31 @@ mod tests {
             rated["status"]["feedback_counts"]["negative"].as_u64(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn consolidate_returns_the_engine_summary_without_an_interaction_turn() {
+        let dir = TempDir::new().unwrap();
+        let mut bridge = bridge(&dir);
+        let trained = train(&mut bridge, 1, "hallo welt");
+        let before = trained["interactions"].as_u64().unwrap();
+        let consolidated = call(&mut bridge, json!({"id": 2, "op": "consolidate"}));
+        assert!(
+            consolidated["ok"].as_bool().unwrap(),
+            "consolidate failed: {consolidated}"
+        );
+        // The engine's own round summary arrives unmodified under "result"
+        // (src/app/message.rs:429-431).
+        let result = &consolidated["result"];
+        assert_eq!(result["scope"].as_str(), Some("active_neighborhood"));
+        assert!(result["active_nodes"].is_u64(), "result: {result}");
+        assert!(result["aliases_added"].is_u64(), "result: {result}");
+        assert!(result["edges_merged"].is_u64(), "result: {result}");
+        assert!(result["quarantined"].is_u64(), "result: {result}");
+        // Consolidation is not a learning-adjacent turn: the interactions
+        // counter did not move (src/graph.rs:338-377 only reads it).
+        let status = call(&mut bridge, json!({"id": 3, "op": "status"}));
+        assert_eq!(status["status"]["interactions"].as_u64(), Some(before));
     }
 
     #[test]
